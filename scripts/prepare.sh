@@ -8,6 +8,7 @@ node -e 'if (Number(process.versions.node.split(".")[0]) !== 24) { console.error
 command -v npm >/dev/null || { echo 'npm is required.' >&2; exit 1; }
 mkdir -p .tools
 npm install --prefix "$root/.tools" --no-audit --no-fund --save-exact pnpm@10.13.1 @openai/codex@0.153.4
+export PATH="$root/.tools/node_modules/.bin:$PATH"
 "$root/.tools/node_modules/.bin/pnpm" install --frozen-lockfile
 "$root/.tools/node_modules/.bin/pnpm" build
 mkdir -p "$root/.tools/bin"

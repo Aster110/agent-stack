@@ -117,7 +117,9 @@ test('exclusive state lease rejects duplicate processes and is released by SIGKI
   const lease=new RuntimeLease(db)
   assert.throws(()=>new RuntimeLease(db),/another process/)
   lease.close()
-  const child=spawn(process.execPath,['--input-type=module','-e',`import {RuntimeLease} from ${JSON.stringify(new URL('./runtime-lease.js',import.meta.url).href)};new RuntimeLease(${JSON.stringify(db)});process.stdout.write('locked');setInterval(()=>{},1000);`],{stdio:['ignore','pipe','ignore']})
+  // Keep the lease owned by the child. A discarded temporary can be garbage
+  // collected before the parent checks the lock, correctly releasing SQLite.
+  const child=spawn(process.execPath,['--expose-gc','--input-type=module','-e',`import {RuntimeLease} from ${JSON.stringify(new URL('./runtime-lease.js',import.meta.url).href)};globalThis.lease=new RuntimeLease(${JSON.stringify(db)});globalThis.gc();process.stdout.write('locked');setInterval(()=>{},1000);`],{stdio:['ignore','pipe','ignore']})
   t.after(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL')})
   await once(child.stdout!,'data');assert.throws(()=>new RuntimeLease(db),/another process/)
   const exited=once(child,'exit');child.kill('SIGKILL');await exited
