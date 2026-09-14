@@ -1,0 +1,23 @@
+{
+  "name": "@cc-mesh/ledger",
+  "version": "0.1.0",
+  "description": "cc-mesh 云端账本（六表存储 + 投影器 + 只读 HTTP API）",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node --test \"dist/**/*.test.js\""
+  },
+  "dependencies": {
+    "@cc-mesh/protocol": "workspace:*",
+    "better-sqlite3": "^13.0.3"
+  },
+  "devDependencies": {
+    "@cc-mesh/relay": "workspace:*",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

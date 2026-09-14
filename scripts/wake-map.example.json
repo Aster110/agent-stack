@@ -1,0 +1,26 @@
+{
+  "_README": [
+    "部署产物样例：真件放 ~/.ccmesh/wake-map.json（不进仓，含机器私有 session 地址）。",
+    "porter 与 wake-hook.sh 共用它：nodeId → 该席位的 app 会话稳定地址 local_<uuid>。",
+    "",
+    "为什么地址是 localId 而不是 CLI sessionId：",
+    "  CLI sessionId **每次热身可能轮换**（同一 app 会话历史上见过 5 个），当地址必错；",
+    "  local_<uuid> 是 app 私有注册表里的稳定 id，跨热身不变，且 ccd send_message 认它。",
+    "",
+    "播种（一次人工，写进 agent-seat-bootstrap 步骤清单）：",
+    "  1) 席位会话里跑 /whoami 拿到当前 CLI sessionId",
+    "  2) grep 'to CLI session <CLI-id>' ~/Library/Logs/Claude/main.log | tail -1",
+    "     → 行里的 local_* 就是稳定地址",
+    "  3) 填进下面的 localId",
+    "",
+    "cwd / sessionName 用于 wake-hook.sh 的判活三证（匹配 ~/.claude/sessions/<pid>.json）。",
+    "label 只用于飞书卡片里的人话称呼。",
+    "键名就是完整 nodeId（device:shortId），一台机可以有多条。"
+  ],
+  "computer2:claude-main": {
+    "localId": "local_00000000-0000-0000-0000-000000000000",
+    "cwd": "/Users/example/workspace/project",
+    "sessionName": "project-main",
+    "label": "computer2 主席位"
+  }
+}

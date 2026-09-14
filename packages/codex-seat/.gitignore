@@ -1,0 +1,5 @@
+dist/
+node_modules/
+# e2e/evidence/ 不再整体忽略：本轮验收的**最终**证据要入库（SUMMARY.md + 每 case 每模式恰一份 JSON）。
+# 纪律：重跑前先 `rm -rf e2e/evidence/*`，跑挂了修好整案重跑并删旧文件——
+# 目录里绝不允许同 case 同模式出现两份（summarize.ts 会把这种情况判 FAIL）。

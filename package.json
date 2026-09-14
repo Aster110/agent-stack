@@ -1,0 +1,31 @@
+{
+  "name": "agent-stack",
+  "private": true,
+  "description": "One agent runtime for computers and servers, with mesh routing and optional WeChat ingress.",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm --filter @cc-mesh/relay dev",
+    "start": "pnpm --filter @cc-mesh/relay start",
+    "test": "pnpm -r test",
+    "test:cli": "bash packages/cli/mesh-proxy.test.sh && bash packages/cli/mesh-register-tmux.test.sh && bash packages/cli/mesh-spawn-launcher.test.sh && bash packages/cli/mesh-init-alias.test.sh && bash packages/cli/mesh-devices.test.sh && bash packages/cli/mesh-delivery-flag.test.sh && bash packages/cli/mesh-inbox-arg.test.sh && bash packages/cli/mesh-ledger-cli.test.sh && bash packages/cli/mesh-image.test.sh",
+    "test:runtime-attachments": "bash scripts/start-relay-attachments.test.sh"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  },
+  "version": "0.1.0-rc.1",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "packageManager": "pnpm@10.13.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Aster110/agent-stack.git"
+  }
+}

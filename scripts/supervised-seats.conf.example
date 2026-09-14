@@ -1,0 +1,11 @@
+# 受监督的常驻席位清单（示例）。
+#
+# 真实清单是**机器本地**的，不进仓：各机席位不同，路径也不同。
+# 装机时 cp 一份到 ~/.ccmesh/supervised-seats.conf 再按本机情况改。
+#
+# 格式：name<TAB>role<TAB>description<TAB>project_dir<TAB>launcher
+# 🔴 分隔符必须是真 TAB，不是空格——description 里本来就允许有空格。
+#
+# launcher 取值见 packages/relay/src/launcher.ts 的 BUILTIN_LAUNCHERS。
+
+codex-main	seat	常驻 codex 席位	/Users/example/workspace/project	codex

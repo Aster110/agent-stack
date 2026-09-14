@@ -1,0 +1,25 @@
+{
+  "name": "@cc-mesh/hub",
+  "version": "0.1.0",
+  "description": "cc-mesh 全局 Hub（WS 路由中心）",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "node --test dist/**/*.test.js"
+  },
+  "dependencies": {
+    "@cc-mesh/ledger": "workspace:*",
+    "@cc-mesh/protocol": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@cc-mesh/relay": "workspace:*",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,29 @@
+# cc-mesh codex 席位 {{SEAT}} —— 由 `codex-seat install --seat {{SEAT}}` 渲染，别手改。
+#
+# 安装：
+#   loginctl enable-linger $USER          # 没有 linger，注销就把 --user 单元一起带走
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now {{UNIT}}
+# 卸载：
+#   systemctl --user disable --now {{UNIT}} && rm ~/.config/systemd/user/{{UNIT}}
+[Unit]
+Description=cc-mesh codex seat {{SEAT}}
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{NODE_BIN}} {{CLI_ENTRY}} run --seat {{SEAT}}
+Restart=always
+RestartSec={{RESTART_SEC}}
+Environment=PATH={{PATH_ENV}}
+Environment=HOME={{HOME_DIR}}
+Environment=LANG={{LANG}}
+WorkingDirectory={{WORKING_DIR}}
+# control-group：codex 是 node wrapper 包 rust 本体，只杀主 pid 会留孤儿
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=append:{{STDOUT_PATH}}
+StandardError=append:{{STDERR_PATH}}
+
+[Install]
+WantedBy=default.target

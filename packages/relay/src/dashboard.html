@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>cc-mesh Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: -apple-system, "SF Mono", Menlo, monospace; }
+  header { padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  .uplink { font-size: 12px; color: var(--muted); }
+  .uplink .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 4px; vertical-align: middle; }
+  .uplink.on .dot { background: var(--ok); }
+  main { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 49px); }
+  #nodes { border-right: 1px solid var(--border); overflow-y: auto; padding: 8px; }
+  .node { padding: 10px 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; cursor: pointer; }
+  .node:hover { border-color: var(--accent); }
+  .node.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .node .id { color: var(--accent); font-weight: 600; font-size: 13px; }
+  .node .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  #term-panel { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  #term-head { padding: 8px 16px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+  #term-head button { background: var(--panel); color: var(--fg); border: 1px solid var(--border); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+  #term-head button:hover { border-color: var(--accent); }
+  #term-body { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
+  #term-frame { flex: 1; width: 100%; height: 100%; border: 0; background: #000; }
+  .empty { display: flex; align-items: center; justify-content: center; flex: 1; color: var(--muted); font-size: 14px; }
+  #events { padding: 8px 16px; max-height: 140px; overflow-y: auto; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+  #events div { padding: 2px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cc-mesh Dashboard</h1>
+  <span id="uplink" class="uplink"><span class="dot"></span><span class="txt">uplink: unknown</span></span>
+  <span class="uplink" id="device"></span>
+</header>
+<main>
+  <aside id="nodes"></aside>
+  <section id="term-panel">
+    <div id="term-head">
+      <span id="term-title">未选择节点</span>
+      <button id="term-open" style="display:none">新窗口打开</button>
+      <button id="term-stop" style="display:none">停止 ttyd</button>
+    </div>
+    <div id="term-body" class="empty">点击左侧节点打开 tmux 终端</div>
+    <div id="events"></div>
+  </section>
+</main>
+<script>
+(() => {
+  const $nodes = document.getElementById("nodes");
+  const $uplink = document.getElementById("uplink");
+  const $uplinkTxt = $uplink.querySelector(".txt");
+  const $device = document.getElementById("device");
+  const $termHead = document.getElementById("term-title");
+  const $termBody = document.getElementById("term-body");
+  const $termStop = document.getElementById("term-stop");
+  const $termOpen = document.getElementById("term-open");
+  const $events = document.getElementById("events");
+
+  const nodes = new Map();
+  let activeSession = null;
+  let activeNodeId = null;
+  let activeTtydPort = null;
+
+  function render() {
+    $nodes.innerHTML = "";
+    for (const n of nodes.values()) {
+      const el = document.createElement("div");
+      el.className = "node" + (n.identity.nodeId === activeNodeId ? " active" : "");
+      el.innerHTML = `<div class="id">${escapeHtml(n.identity.shortId)}</div>
+        <div class="meta">${escapeHtml(n.identity.role)} · ${escapeHtml(n.identity.description || "")}</div>
+        <div class="meta">${escapeHtml(n.sessionId)}</div>`;
+      el.addEventListener("click", () => openTerminal(n));
+      $nodes.appendChild(el);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  }
+
+  async function openTerminal(node) {
+    if (activeSession && activeSession !== node.sessionId) {
+      await stopTtyd(activeSession);
+    }
+    activeSession = node.sessionId;
+    activeNodeId = node.identity.nodeId;
+    $termHead.textContent = `${node.identity.nodeId} — ${node.sessionId}`;
+    $termBody.className = "";
+    $termBody.innerHTML = "<div class='empty'>启动中...</div>";
+    try {
+      const r = await fetch(`/api/terminal/ttyd/${encodeURIComponent(node.sessionId)}`, { method: "POST" });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || "ttyd start failed");
+      const port = j.data.port;
+      activeTtydPort = port;
+      $termBody.className = "";
+      $termBody.innerHTML = `<iframe id="term-frame" src="http://localhost:${port}/"></iframe>`;
+      $termStop.style.display = "inline-block";
+      $termOpen.style.display = "inline-block";
+    } catch (e) {
+      $termBody.innerHTML = `<div class="empty">启动失败: ${escapeHtml(e.message)}</div>`;
+    }
+    render();
+  }
+
+  async function stopTtyd(sessionId) {
+    try { await fetch(`/api/terminal/ttyd/${encodeURIComponent(sessionId)}`, { method: "DELETE" }); } catch {}
+  }
+
+  $termOpen.addEventListener("click", () => {
+    if (activeTtydPort) window.open(`http://localhost:${activeTtydPort}/`, `ttyd-${activeSession}`);
+  });
+
+  $termStop.addEventListener("click", async () => {
+    if (activeSession) {
+      await stopTtyd(activeSession);
+      activeSession = null;
+      activeNodeId = null;
+      activeTtydPort = null;
+      $termHead.textContent = "未选择节点";
+      $termBody.className = "empty";
+      $termBody.innerHTML = "点击左侧节点打开 tmux 终端";
+      $termStop.style.display = "none";
+      $termOpen.style.display = "none";
+      render();
+    }
+  });
+
+  function logEvent(event, data) {
+    const d = document.createElement("div");
+    const t = new Date().toLocaleTimeString();
+    d.textContent = `[${t}] ${event} ${JSON.stringify(data).slice(0, 120)}`;
+    $events.insertBefore(d, $events.firstChild);
+    while ($events.children.length > 50) $events.removeChild($events.lastChild);
+  }
+
+  async function bootstrap() {
+    try {
+      const r = await fetch("/api/status");
+      const j = await r.json();
+      if (j.ok) {
+        $device.textContent = `device: ${j.data.deviceId}`;
+        for (const n of j.data.nodes) nodes.set(n.identity.nodeId, n);
+        if (j.data.uplink) setUplink(j.data.uplink.connected);
+        render();
+      }
+    } catch {}
+  }
+
+  function setUplink(connected, hubUrl) {
+    $uplink.classList.toggle("on", !!connected);
+    $uplinkTxt.textContent = `uplink: ${connected ? "connected" : "offline"}${hubUrl ? " · " + hubUrl : ""}`;
+  }
+
+  const es = new EventSource("/api/events");
+  es.onmessage = (e) => {
+    try {
+      const { event, data } = JSON.parse(e.data);
+      logEvent(event, data);
+      if (event === "node:register") {
+        nodes.set(data.node.identity.nodeId, data.node);
+        render();
+      } else if (event === "node:unregister") {
+        nodes.delete(data.nodeId);
+        render();
+      } else if (event === "uplink:status") {
+        setUplink(data.connected, data.hubUrl);
+      }
+    } catch {}
+  };
+  es.onerror = () => { /* 浏览器会自动重连 */ };
+
+  bootstrap();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  cc-mesh codex 席位 {{SEAT}} —— 由 `codex-seat install --seat {{SEAT}}` 渲染，别手改。
+
+  安装：launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{{LABEL}}.plist
+  卸载：launchctl bootout gui/$(id -u)/{{LABEL}}
+
+  必须 gui/<uid>（不是 system）：席位跑的是用户态 codex，要 login keychain 和用户会话；
+  node_repl MCP（Computer Use）也只有在用户 GUI 会话里才拿得到权限。
+
+  PATH 必须显式写：launchd 只给系统四个目录，node/codex/mesh 都在 /opt/homebrew/bin，
+  不写就 "env: node: No such file or directory" 静默失败，而 launchctl list 照样显示 loaded。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{{LABEL}}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{NODE_BIN}}</string>
+    <string>{{CLI_ENTRY}}</string>
+    <string>run</string>
+    <string>--seat</string>
+    <string>{{SEAT}}</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{PATH_ENV}}</string>
+    <key>HOME</key>
+    <string>{{HOME_DIR}}</string>
+    <key>LANG</key>
+    <string>{{LANG}}</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>{{WORKING_DIR}}</string>
+
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>{{THROTTLE_SEC}}</integer>
+
+  <!-- Interactive：席位要能拉起 node_repl MCP 做 Computer Use，不能被降级成后台批处理 -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>{{STDOUT_PATH}}</string>
+  <key>StandardErrorPath</key>
+  <string>{{STDERR_PATH}}</string>
+</dict>
+</plist>

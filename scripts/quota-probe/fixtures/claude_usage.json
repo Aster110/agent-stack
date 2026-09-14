@@ -1,0 +1,23 @@
+{
+  "limits": [
+    {
+      "kind": "session",
+      "scope": null,
+      "percent": 23,
+      "resets_at": "2026-08-26T15:00:00Z"
+    },
+    {
+      "kind": "weekly_all",
+      "scope": null,
+      "percent": 61,
+      "resets_at": "2026-09-01T00:00:00Z"
+    },
+    {
+      "kind": "weekly_scoped",
+      "scope": { "model": { "display_name": "Claude Opus 4.8" } },
+      "percent": 88,
+      "resets_at": "2026-09-01T00:00:00Z"
+    }
+  ],
+  "extra_usage": { "is_enabled": true, "used_credits": 1250 }
+}

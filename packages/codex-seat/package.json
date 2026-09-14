@@ -1,0 +1,25 @@
+{
+  "name": "@cc-mesh/codex-seat",
+  "version": "0.1.0",
+  "description": "cc-mesh 常驻 codex 席位 v2：codex app-server 引擎 + 薄 sidecar（pull 注册 / 长轮询 / 三态回执 / 控制消息 / WAL / 保活）",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "bin": {
+    "codex-seat": "dist/src/cli/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node --test \"dist/src/**/*.test.js\"",
+    "test:contracts": "node --test dist/src/contracts.test.js",
+    "e2e": "node dist/e2e/run.js"
+  },
+  "dependencies": {
+    "@cc-mesh/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}
