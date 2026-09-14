@@ -22,3 +22,5 @@ jobs:
       - run: pnpm build
       - run: pnpm test
       - run: pnpm test:cli
+      - run: python3 scripts/deploy.test.py
+      - run: node --test scripts/pair-wechat.test.mjs

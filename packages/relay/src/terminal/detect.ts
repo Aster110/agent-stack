@@ -4,6 +4,7 @@ import { ITermTerminal } from "./iterm.js"
 import { TmuxTerminal } from "./tmux.js"
 import { CompositeTerminal } from "./composite.js"
 import type { ITerminal } from "./interface.js"
+import { NoTerminal } from "./none.js"
 
 function defaultHasTmux(): boolean {
   try {
@@ -38,6 +39,8 @@ export function createTerminal(probes?: TerminalProbes): ITerminal {
 
   if (env) {
     switch (env) {
+      case "none":
+        return new NoTerminal()
       case "tmux":
         if (!hasTmux()) throw new Error("MESH_TERMINAL=tmux but tmux is not installed")
         console.log("[mesh-relay] terminal backend: TmuxTerminal (env: MESH_TERMINAL=tmux)")
@@ -58,7 +61,7 @@ export function createTerminal(probes?: TerminalProbes): ITerminal {
         })
       }
       default:
-        throw new Error(`MESH_TERMINAL="${env}" is not valid. Use "tmux", "iterm", or "composite".`)
+        throw new Error(`MESH_TERMINAL="${env}" is not valid. Use "none", "tmux", "iterm", or "composite".`)
     }
   }
 

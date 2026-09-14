@@ -107,7 +107,7 @@ if (require.main === module) {
   const authKind = auth instanceof TokenAuth ? "TokenAuth" : "NoAuth"
   const ledger = ledgerFromEnv()
   const attachments = attachmentsFromEnv()
-  createHub({ port, auth, ledger, attachments }).then((hub) => {
+  createHub({ port, host: process.env.MESH_HUB_HOST, auth, ledger, attachments }).then((hub) => {
     const ledgerKind = !ledger
       ? "disabled"
       : hub.ledger

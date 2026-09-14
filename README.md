@@ -2,7 +2,7 @@
 
 同一份代码，在电脑和服务器运行 Codex 席位，通过 mesh 协作；主脑额外接入微信。Claude App 可使用同仓的 relay pull / SSE 接口。
 
-**当前版本：`v0.1.0-rc.1`，公开候选版。尚未发布生产稳定版，也未完成既有设备的统一迁移。**
+**当前版本：`v0.1.0-rc.2`，公开候选版。尚未发布生产稳定版，也未完成既有设备的统一迁移。**
 
 ```text
 微信 → WeChat transport → 主脑 runSeat → Codex app-server
@@ -27,12 +27,12 @@ Hub 通常与主脑部署在同一台服务器，每台设备各有一个本地 
 下载版本源码并解压后，macOS 双击 `一键准备.command`；终端执行：
 
 ```bash
-git clone --branch v0.1.0-rc.1 https://github.com/Aster110/agent-stack.git
+git clone --branch v0.1.0-rc.2 https://github.com/Aster110/agent-stack.git
 cd agent-stack
 bash scripts/bootstrap.sh
 ```
 
-准备脚本校验并安装 Node 24.13.0、pnpm 10.13.1 和 Codex CLI 0.153.4 到项目 `.tools/`，构建全部包，不修改全局 Node、不注册服务。Linux 缺少构建工具时自动用 apt 安装；Mac 如缺开发工具会打开系统安装窗口，完成后重跑。本版本尚不是包含配对和服务托管的完整新机一键部署器。
+准备脚本校验并安装 Node 24.13.0、pnpm 10.13.1 和 Codex CLI 0.153.4 到项目 `.tools/`，构建全部包，不修改全局 Node、不注册服务。Linux 缺少构建工具时自动用 apt 安装；Mac 如缺开发工具会打开系统安装窗口，完成后重跑。随后按 SOP 使用 deploy.py 生成配置、扫码配对并安装 launchd/systemd 服务；登录与扫码由本人完成。
 
 电脑、服务器和主脑使用 `packages/agent-runtime` 的同一个入口，由配置选择 `computer`、`server` 或 `brain`。主脑开启 `wechat`，不再另外启动 cc2wechat daemon。Hub、relay、Codex 驱动、微信 transport 都在本仓，不需访问私有仓库。
 

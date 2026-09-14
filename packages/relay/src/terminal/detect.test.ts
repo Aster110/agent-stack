@@ -50,6 +50,16 @@ function probes(hasTmux: boolean, hasITerm: boolean): TerminalProbes {
 }
 
 describe("createTerminal — MESH_TERMINAL 显式指定", () => {
+  it("pull-only mode never probes installed terminals and refuses terminal side effects", async () => {
+    const term = withEnv({ MESH_TERMINAL: "none" }, () => createTerminal({
+      hasTmux: () => { throw new Error('must not probe tmux') },
+      hasITerm: () => { throw new Error('must not probe iTerm') },
+    }))
+    assert.equal(await term.inject('missing', 'text'), false)
+    assert.equal(await term.getCurrentSession(), null)
+    await assert.rejects(term.spawn('echo test'), /disabled/)
+    await assert.rejects(term.close('missing'), /disabled/)
+  })
   it("MESH_TERMINAL=tmux + hasTmux=true → TmuxTerminal", () => {
     withEnv({ MESH_TERMINAL: "tmux" }, () => {
       const term = createTerminal(probes(true, false))

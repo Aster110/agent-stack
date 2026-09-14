@@ -9,6 +9,8 @@ export interface LoginResult {
   token: string;
   accountId: string;
   baseUrl?: string;
+  /** Identity returned by the platform's confirmed QR login, never the first sender. */
+  ownerId?: string;
 }
 
 /**
@@ -62,6 +64,7 @@ export async function loginWithQR(baseUrl?: string): Promise<LoginResult> {
             token: status.bot_token,
             accountId: status.ilink_bot_id,
             baseUrl: status.baseurl,
+            ownerId: status.ilink_user_id,
           };
       }
 
@@ -281,6 +284,7 @@ export async function loginWithQRWeb(baseUrl?: string): Promise<LoginResult> {
               token: status.bot_token,
               accountId: status.ilink_bot_id,
               baseUrl: status.baseurl,
+              ownerId: status.ilink_user_id,
             };
         }
 

@@ -23,6 +23,7 @@ function pongTimeoutMs(): number {
 
 export interface HubOptions {
   port?: number
+  host?: string
   auth?: IAuth
   /**
    * 云端账本（设计 §3）。**不传 = 完全的现行为**——Hub 保持纯内存路由，
@@ -52,7 +53,7 @@ interface RelayEntry {
 export async function createHub(opts: HubOptions = {}): Promise<HubInstance> {
   const port = opts.port ?? HUB_WS_PORT
   const auth = opts.auth ?? new NoAuth()
-  const wss = new WebSocketServer({ port })
+  const wss = new WebSocketServer({ port, host: opts.host })
   await new Promise<void>((resolve, reject) => {
     wss.once("listening", () => resolve())
     wss.once("error", reject)

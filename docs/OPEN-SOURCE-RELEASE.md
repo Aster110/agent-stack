@@ -1,6 +1,6 @@
 # Open-source candidate release
 
-Target tag: v0.1.0-rc.1. Status: verified open-source candidate; not a production stable release.
+Target tag: v0.1.0-rc.2. Status: verified open-source candidate; not a production stable release.
 
 This repository starts from the unified source candidate, excluding historical Git objects, captured operational evidence, private skill content, host-specific deployment scripts and generated caches. Runtime code, tests and generic tooling remain together. Deployment defaults and examples use local addresses or fictional identifiers; legacy skill installation no longer reads a personal documentation repository.
 
