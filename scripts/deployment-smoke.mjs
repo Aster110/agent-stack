@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import {randomBytes} from 'node:crypto';
 import {spawn,execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {createRequire} from 'node:module';
+const Database=createRequire(new URL('../packages/agent-runtime/package.json',import.meta.url))('better-sqlite3');
 const source=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'stack-deployment-'));
 const token=path.join(root,'token');fs.writeFileSync(token,randomBytes(32).toString('hex'),{mode:0o600});
@@ -60,6 +62,14 @@ try {
  await until(()=>JSON.stringify(outputs).includes(nonce),'WeChat fixture receives result');
  // Require an actual correlated peer result in brain context, not the first acknowledgement.
  await until(()=>Object.keys(state(brain,'brain').taskResultOrigins??{}).length>0,'correlated peer result accepted by brain');
+ await until(()=>{
+  const ids=Object.values(state(brain,'brain').taskResultOrigins??{});
+  const db=new Database(path.join(brain,'state/wechat.sqlite'),{readonly:true,fileMustExist:true});
+  try{return ids.some(id=>{
+   const row=db.prepare('SELECT text,done FROM delivery WHERE id=?').get(id+':done');
+   return row?.done===1 && row.text.includes(nonce);
+  });}finally{db.close();}
+ },'completed peer-result response acknowledged by WeChat fixture');
  check('Real brain dispatched through Hub; real computer created the exact requested file');
  const before=state(brain,'brain').mainThreadId;
  await stop(runtime);runtime=await start(brain,'runtime');
