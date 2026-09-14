@@ -39,6 +39,8 @@ python3 scripts/source-version.py --verify
 
 `source .tools/env.sh` 对当前终端生效，服务自行使用绝对路径。官方登录以安装的 `codex login --help` 为准，不复制别人的认证。账号与网络可用性必须实际核验。
 
+ZIP 不含 Git 历史，source-version 的 commit 会为 null；此时用 Release 页面列出的提交和源码哈希核对，不把 null 当作已证明相同提交。跨机 sourceHash 仍须一致。
+
 ## 3. 服务器生成配置、扫码和启动
 
 下面在服务器 root 的源码目录执行。先确认 19800、19900 空闲；冲突时选新端口并同步全部相关配置。Hub、relay 默认只绑定回环地址，电脑经 SSH 隧道连接，不需要先准备域名、证书或开放新的公网服务端口。

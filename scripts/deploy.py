@@ -104,6 +104,11 @@ def quote_unit(value):
     return '"'+str(value).replace('\\','\\\\').replace('"','\\"').replace('%','%%')+'"'
 
 
+def working_directory_unit(value):
+    # This directive takes the entire RHS as its path; ExecStart quoting is not valid here.
+    return str(value).replace('%','%%')
+
+
 def supervisors(profile, action, render_only=False):
     config = load(profile)
     runtime = json.loads((profile/'runtime.json').read_text())
@@ -114,6 +119,7 @@ def supervisors(profile, action, render_only=False):
         raise ValueError('Linux service installation requires root (use the same account for login and services).')
     controller = ['launchctl'] if mac else ['systemctl']
     services = list(config['services'])
+    failures = []
     if action == 'stop': services.reverse()
     for service in services:
         name = f'org.agentstack.{config["device"]}.{service}'
@@ -127,7 +133,7 @@ def supervisors(profile, action, render_only=False):
         else:
             target = pathlib.Path('/etc/systemd/system')/(name+'.service')
             payload = ('[Unit]\nDescription=Agent Stack '+service+'\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n'
-                '[Service]\nType=simple\nExecStart='+' '.join(map(quote_unit,argv))+'\nWorkingDirectory='+quote_unit(ROOT)+'\n'
+                '[Service]\nType=simple\nExecStart='+' '.join(map(quote_unit,argv))+'\nWorkingDirectory='+working_directory_unit(ROOT)+'\n'
                 'Restart=always\nRestartSec=10\nTimeoutStopSec=90\nKillMode=control-group\nUMask=0077\n'
                 '[Install]\nWantedBy=multi-user.target\n').encode()
         if action == 'install':
@@ -136,6 +142,8 @@ def supervisors(profile, action, render_only=False):
             os.chmod(rendered,0o600)
             if render_only:
                 print(str(rendered)); continue
+            if not mac:
+                subprocess.run(['systemd-analyze','verify',str(rendered)],check=True,stdout=subprocess.DEVNULL)
             if target.exists() and target.read_bytes() != payload:
                 raise ValueError('Different existing service definition preserved: '+str(target))
             target.parent.mkdir(parents=True,exist_ok=True)
@@ -146,13 +154,16 @@ def supervisors(profile, action, render_only=False):
                     subprocess.run(controller+['bootstrap',destination,str(target)],check=True)
             else:
                 subprocess.run(controller+['daemon-reload'],check=True)
-                subprocess.run(controller+['enable','--now',target.name],check=True)
+                subprocess.run(controller+['enable',target.name],check=True)
+                subprocess.run(controller+['start',target.name],check=True)
+                subprocess.run(controller+['is-active','--quiet',target.name],check=True)
             print('Installed '+name)
         elif mac:
             command = ['bootout',destination,str(target)] if action=='stop' else ['print',destination+'/'+name]
-            subprocess.run(controller+command,check=True)
+            if subprocess.run(controller+command).returncode: failures.append(name)
         else:
-            subprocess.run(controller+[action,'--no-pager',target.name],check=True)
+            if subprocess.run(controller+[action,'--no-pager',target.name]).returncode: failures.append(name)
+    if failures: raise ValueError('Services needing attention: '+', '.join(failures))
 
 
 def main():

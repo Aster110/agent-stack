@@ -41,6 +41,9 @@ class DeployTest(unittest.TestCase):
         self.assertIn(str(self.profile),plist['ProgramArguments'])
         for file in (self.profile/'units').iterdir():
             self.assertNotIn(self.token.read_text().encode(),file.read_bytes())
+            if file.suffix == '.service':
+                directive=next(line for line in file.read_text().splitlines() if line.startswith('WorkingDirectory='))
+                self.assertEqual(directive.partition('=')[2],str(self.root))
         with self.assertRaisesRegex(ValueError,'already exists'):
             deploy.initialize(self.args,self.profile)
 
