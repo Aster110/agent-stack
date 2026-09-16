@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import http from 'node:http'
 import Database from 'better-sqlite3'
 import {runSeat,resolveSeatConfig,atomicWriteFileSync,type SeatRuntimeOptions,type SeatHandle} from '@cc-mesh/codex-seat'
 import {DurableWeChatChannel,type WeChatAccount,type WeChatApi} from './wechat.js'
@@ -14,6 +15,7 @@ export interface RuntimeConfig {
   stateRoot:string
   relayUrl:string
   relayDatabase?:string
+  healthPort?:number
   peerNodes:string[]
   codex:{bin:string;home?:string;model?:string;reasoningEffort?:string}
   /** This candidate retains the existing engine policy, so acknowledgement is explicit. */
@@ -31,6 +33,7 @@ export function validateRuntimeConfig(value:unknown):RuntimeConfig {
   if(!c.codex||!path.isAbsolute(c.codex.bin))throw new Error('explicit absolute codex.bin required')
   if(c.codex.home&&!path.isAbsolute(c.codex.home))throw new Error('codex.home must be absolute')
   if(c.executionPolicy!=='full-access')throw new Error('this candidate only implements explicit full-access; choose no deployment if that is unsuitable')
+  if(c.healthPort!==undefined&&(!Number.isInteger(c.healthPort)||c.healthPort<1||c.healthPort>65535))throw new Error('invalid healthPort')
   if(c.wechat&&(c.role!=='brain'||!path.isAbsolute(c.wechat.accountFile)||!c.wechat.ownerId))throw new Error('WeChat requires brain role, account file and explicit owner')
   if(c.wechat&&(!c.relayDatabase||!path.isAbsolute(c.relayDatabase)))throw new Error('brain needs local relayDatabase to correlate task results')
   return c
@@ -48,6 +51,7 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
   let channel:DurableWeChatChannel|null=null
   let taskDb:Database.Database|null=null
   let seat:SeatHandle|undefined
+  let health:http.Server|undefined
   const lease=new RuntimeLease(path.join(c.stateRoot,'runtime-lock.sqlite'))
   try{
     const manifestFile=path.join(c.stateRoot,'runtime-format.json')
@@ -80,9 +84,23 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
           const row=taskDb!.prepare('SELECT "from" AS sender,"to" AS target,type,payload FROM messages WHERE id=?').get(replyTo) as {sender:string;target:string;type:string;payload:string}|undefined
           return !!row && row.sender===to && row.target===from && ['task','chat'].includes(row.type) && !row.payload.startsWith('[ctl:')
         }}:{})})
+    if(c.healthPort){
+      health=http.createServer((req,res)=>{
+        if(req.method!=='GET'||req.url!=='/health'){res.writeHead(404).end();return}
+        void seat!.status().then(status=>{
+          res.setHeader('Content-Type','application/json')
+          res.end(JSON.stringify({status:'running',delivery:'channel',backend:'codex-app-server',nodeId:seat!.nodeId,threadId:seat!.state().mainThreadId,engine:status.engine,queue:status.queue,wechat:channel?.health()??null}))
+        },()=>res.writeHead(503).end())
+      })
+      await new Promise<void>((resolve,reject)=>{health!.once('error',reject);health!.listen(c.healthPort,'127.0.0.1',()=>{health!.off('error',reject);resolve()})})
+    }
     channel?.start(seat)
     let stopped=false
-    return {seat,wechat:channel,async stop(){if(stopped)return;stopped=true;await seat!.stop('unified runtime stop');await channel?.stop();taskDb?.close();lease.close()}}
-  }catch(error){await seat?.stop('startup failed').catch(()=>{});await channel?.stop().catch(()=>{});taskDb?.close();lease.close();throw error}
+    return {seat,wechat:channel,async stop(){
+      if(stopped)return;stopped=true;health?.close()
+      try{await seat!.stop('unified runtime stop')}
+      finally{try{await channel?.stop()}finally{try{taskDb?.close()}finally{lease.close()}}}
+    }}
+  }catch(error){health?.close();await seat?.stop('startup failed').catch(()=>{});await channel?.stop().catch(()=>{});taskDb?.close();lease.close();throw error}
 }
 export {WeChatStore,DurableWeChatChannel}

@@ -180,6 +180,7 @@ async function shutdown() {
   ledgerSync?.stop()
   await ttyd.shutdown()
   if (uplink) await uplink.disconnect()
+  app.closeDoorbell()
   app.store.close()
   server.close(() => {
     try { fs.unlinkSync(relayPidFile) } catch {}

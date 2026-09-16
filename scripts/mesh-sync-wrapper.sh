@@ -51,7 +51,7 @@ while : ; do
     set -- "$@" --data-urlencode "since=${SINCE}"
   fi
 
-  resp="$(curl "$@" 2>/dev/null)"
+  resp="$(curl --noproxy '*' "$@" 2>/dev/null)"
   rc=$?
 
   if [ "$rc" -ne 0 ]; then

@@ -171,6 +171,10 @@ export class WebSocketUplink implements IUplink {
     this.ws.send(JSON.stringify(reg))
   }
 
+  sendListenerStatus(listeners: import('@cc-mesh/protocol').ListenerStatus[]): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'listener_status', listeners }))
+  }
+
   private handleDownlink(raw: string): void {
     let msg: DownlinkMessage
     try { msg = JSON.parse(raw) as DownlinkMessage } catch { return }

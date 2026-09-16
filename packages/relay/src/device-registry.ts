@@ -14,7 +14,10 @@ export class DeviceRegistryCache {
   }
 
   list(): DeviceInventory[] {
-    return this.devices
+    return this.devices.map(d => ({ ...d, listeners: d.listeners?.map(s => ({ ...s,
+      state: (s.state === 'listening' || s.state === 'waking' || s.expiresAt !== null)
+        && (!s.expiresAt || !Number.isFinite(Date.parse(s.expiresAt)) || Date.parse(s.expiresAt) <= Date.now()) ? 'lost' : s.state,
+    })) }))
   }
 
   source(): "hub" | "cache" {
@@ -22,10 +25,15 @@ export class DeviceRegistryCache {
   }
 
   update(devices: DeviceInventory[], source: "hub" | "cache" = "hub"): void {
-    this.devices = devices
+    const receivedAt = Date.now()
+    this.devices = devices.map(d => ({ ...d, listeners: d.listeners?.map(s => ({ ...s,
+      // Hub emits remaining TTL on EVERY broadcast; translate once to this clock.
+      observedAt: new Date(receivedAt).toISOString(),
+      expiresAt: s.expiresAt === null ? null : new Date(receivedAt + Math.min(60_000, Math.max(0, Number.isFinite(s.validForMs) ? s.validForMs : 0))).toISOString(),
+    })) }))
     this.currentSource = source
     fs.mkdirSync(path.dirname(this.file), { recursive: true })
-    fs.writeFileSync(this.file, JSON.stringify(devices, null, 2), "utf8")
+    fs.writeFileSync(this.file, JSON.stringify(this.devices, null, 2), "utf8")
   }
 
   private load(): void {

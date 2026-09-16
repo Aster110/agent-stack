@@ -20,11 +20,25 @@ export interface NodeIdentity {
 
 export type NodeRole = "main" | "worker" | "service"
 
+export interface ListenerStatus {
+  nodeId: string
+  state: "listening" | "waking" | "lost" | "unknown"
+  instanceId: string | null
+  connected: boolean
+  lastAckAt: string | null
+  lastSyncAt: string | null
+  lastExecutionStartedAt: string | null
+  observedAt: string
+  expiresAt: string | null
+  validForMs: number
+}
+
 export interface DeviceInventory {
   deviceId: string
   relayId: string
   nodes: NodeIdentity[]
   updatedAt: string
+  listeners?: ListenerStatus[]
 }
 
 // ===== 本地节点（relay 内部用） =====
@@ -172,6 +186,7 @@ export type UplinkMessage =
   | { type: "message"; msg: MeshMessage }
   | { type: "spawn"; requestId: string; targetDevice: string; spawn: SpawnRequest }
   | { type: "spawn_result"; requestId: string; targetRelayId: string; result: MeshResponse }
+  | { type: "listener_status"; listeners: ListenerStatus[] }
   | { type: "ping" }
   | { type: "ledger"; relayId: string; events: LedgerUplinkEvent[] }   // 账本游标同步批（老 Hub 静默丢弃→部署顺序先 Hub 后 relay）
 

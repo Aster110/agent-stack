@@ -43,7 +43,7 @@ export class DurableWeChatChannel implements SeatChannel {
     for(const message of this.store.pending()){
       // Candidate text path: do not silently fabricate attachment contents.
       const unsupported=message.raw.item_list?.some(i=>i.type!==1 && !(i.type===3 && i.voice_item?.text))
-      const text=unsupported?'The owner sent an attachment that this candidate transport cannot download. Tell the owner this limitation; do not pretend to have read it.':extractText(message.raw)
+      const text=extractText(message.raw)+(unsupported?'\n[通道提示：本条还有附件，当前通道尚未下载附件内容。请如实说明限制，不要假装已读。]':'')
       try{
         this.seat.deliver({channel:'wechat',endpointId:this.ownerId,id:message.id,text})
         this.store.accepted(message.id)

@@ -53,4 +53,10 @@ test('same runtime assembles brain and computer with real relay, correlated resu
   assert.equal(terminalCalls,0)
   assert.equal((await computer.seat.status()).wal.completed,0)
   await assert.rejects(startUnifiedRuntime(brainConfig),/another process/)
+  const realStop=brain.seat.stop.bind(brain.seat)
+  brain.seat.stop=async reason=>{await realStop(reason);throw new Error('drain failure fixture')}
+  await assert.rejects(brain.stop(),/drain failure/)
+  assert.equal(brain.wechat!.health().pending,null,'failed drain still closes the intake store')
+  const replacement=await startUnifiedRuntime(brainConfig,{seat:{engine:new FakeAppServerClient(),log:()=>{}},wechatApi:{poll:async()=>({ret:0,msgs:[]}),send:async()=>({messageId:'1'})}})
+  runtimes.push(replacement)
 })

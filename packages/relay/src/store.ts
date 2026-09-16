@@ -112,6 +112,15 @@ export class Store {
     // 按 created_at + rowid 顺序回填单调 seq（一次性，幂等：只填 NULL 行）。
     this.backfillSeq()
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_seq ON messages(seq);`)
+    // 启动自检：把「不可能游标」喊出来。只报不改——理由见 getAckCursor 注释。
+    // 这是本次事故唯一真正缺的东西：坏了 5 天，全程零报错、零日志。
+    for (const c of this.findImpossibleCursors()) {
+      console.warn(
+        `[store] ⚠️ 不可能的 ack 游标：${c.nodeId} last_ack_seq=${c.lastAckSeq} > head=${c.headSeq}。` +
+        `该节点正在静默失聪（send 返回 accepted 但永远取不到货）。` +
+        `修法：确定该从哪个 seq 续，再直接改库 ack_cursors（API 层有防倒退闸，改不下来）。`,
+      )
+    }
   }
 
   /** 回填老消息的 seq（NULL → 按 rowid 顺序赋单调值），保证游标可达。 */
@@ -235,19 +244,50 @@ export class Store {
 
   // ===== Ack 游标（per-node，单调推进） =====
 
-  /** 推进 node 的 ack 游标到 upToSeq（取 max，防倒退），并把 seq<=upToSeq 的消息标 acked。 */
+  /**
+   * 当前最大 seq —— 游标的**物理上界**（空库为 0）。
+   *
+   * 为什么它就是上界：seq 一律由本机 `MAX(seq)+1` 赋值（saveMessage 与下行
+   * INSERT OR IGNORE 两条入库路径都是，见上文），消息必须先拿到 seq 才可能被投递。
+   * 所以任何**真实**回执的 upToSeq 必然 ≤ 当时的 head。生产代码不删 messages 行，
+   * head 单调不减。
+   */
+  headSeq(): number {
+    return (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM messages").get() as any).m as number
+  }
+
+  /**
+   * 推进 node 的 ack 游标到 upToSeq（取 max，防倒退），并把 seq<=upToSeq 的消息标 acked。
+   *
+   * ⚠️ 上界钳制（2026-09-05/08 claude-main 失聪事故）：upToSeq 先钳到 headSeq()。
+   * `last_ack_seq > MAX(seq)` 是**物理上不可能**的状态（理由见 headSeq 注释），
+   * 只可能来自误用——事故实例：把门铃 state 文件里的 phase epoch（`since` 字段，
+   * 与 /api/sync 的 seq 游标**重名但不同物**）当游标喂进了 `/api/sync?since=`，
+   * 一个 17 亿的 epoch 就此写进 seq 空间。
+   *
+   * 为什么必须钳、不能放任：游标只升不降，天文数字一旦落库就**永久焊死**——
+   * 该节点从此静默失聪（`mesh send` 照样返回 accepted、消息照常入库，
+   * 但 `WHERE seq > 1788622349` 永远为空），真实 seq 追不上，没有任何自愈路径。
+   *
+   * 为什么钳制不破坏「防倒退」：ON CONFLICT 仍取 MAX(last_ack_seq, ...)，
+   * 乱序/重复/重放送来的**偏小**值照样推不动游标。本闸只压**大到不可能**的值。
+   * 两者管的是相反的两端，互不干涉；合法回执（upToSeq ≤ head）走到这里是 no-op。
+   */
   ack(nodeId: string, upToSeq: number): void {
     const tx = this.db.transaction(() => {
+      // 非有限值（NaN/Infinity）归零：0 经 MAX() 即「不推进」，绝不写坏游标。
+      const requested = Number.isFinite(upToSeq) ? Math.floor(upToSeq) : 0
+      const capped = Math.min(requested, this.headSeq())
       // 游标取 max：乱序/重复/倒退 ack 不把游标拉回
       this.db.prepare(`
         INSERT INTO ack_cursors (node_id, last_ack_seq) VALUES (?, ?)
         ON CONFLICT(node_id) DO UPDATE SET last_ack_seq = MAX(last_ack_seq, excluded.last_ack_seq)
-      `).run(nodeId, upToSeq)
-      // 标记销账：该 node 直发 + 广播，seq<=upToSeq 的置 acked=1
+      `).run(nodeId, capped)
+      // 标记销账：该 node 直发 + 广播，seq<=capped 的置 acked=1
       this.db.prepare(`
         UPDATE messages SET acked = 1
         WHERE ("to" = ? OR "to" = '*') AND seq <= ? AND seq IS NOT NULL
-      `).run(nodeId, upToSeq)
+      `).run(nodeId, capped)
     })
     tx()
   }
@@ -269,10 +309,39 @@ export class Store {
     return row ? (row.n as number) : 0
   }
 
-  /** 读 node 的当前 ack 游标（未 ack 过返回 0）。 */
+  /**
+   * 读 node 的当前 ack 游标（未 ack 过返回 0）。**故意不在读时钳上界。**
+   *
+   * 一版实现曾在这里 `Math.min(stored, headSeq())` 想让存量脏库「自愈」，被自己的
+   * 测试打回：钳到 head 等于宣布「head 之前的都算已收」，被焊死期间积压的消息**当场
+   * 静默丢光**——本次事故里就是 seq 6620/6621 那两条。用一个静默失败换掉另一个静默
+   * 失败，不是修复。正确的存量修法是人工判断该从哪个 seq 续（事故里是 6619，
+   * 恰好保住那两条），机器没有信息做这个判断。
+   *
+   * 所以存量脏值的出路是**被看见**，不是被偷偷改：见 findImpossibleCursors()
+   * ——启动自检会把它们喊出来。写闸（ack 里的 Math.min）保证不再产生新的脏值。
+   */
   getAckCursor(nodeId: string): number {
     const row = this.db.prepare("SELECT last_ack_seq FROM ack_cursors WHERE node_id = ?").get(nodeId) as any
     return row ? (row.last_ack_seq as number) : 0
+  }
+
+  /**
+   * 找出**物理上不可能**的游标行（last_ack_seq > MAX(seq)）。
+   *
+   * 加了写闸之后 ack() 再也造不出这种行，所以命中的只可能是：
+   * ①加闸之前遗留的脏行（本次事故的 claude-main / ops-probe）②有人手改了库。
+   * 两种都该有人看一眼——这种节点正在**静默失聪**：`mesh send` 照样 accepted，
+   * 但 `WHERE seq > <天文数字>` 永远为空，没有任何报错、没有任何日志。
+   *
+   * 只报不改：怎么续（从哪个 seq 起）要人判断，机器猜一个就是丢信。
+   */
+  findImpossibleCursors(): Array<{ nodeId: string; lastAckSeq: number; headSeq: number }> {
+    const head = this.headSeq()
+    const rows = this.db.prepare(
+      "SELECT node_id, last_ack_seq FROM ack_cursors WHERE last_ack_seq > ? ORDER BY last_ack_seq DESC",
+    ).all(head) as Array<{ node_id: string; last_ack_seq: number }>
+    return rows.map((r) => ({ nodeId: r.node_id, lastAckSeq: r.last_ack_seq, headSeq: head }))
   }
 
   // ===== Nodes =====

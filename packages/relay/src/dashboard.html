@@ -82,7 +82,10 @@
       el.className = "node" + (n.identity.nodeId === activeNodeId ? " active" : "");
       el.innerHTML = `<div class="id">${escapeHtml(n.identity.shortId)}</div>
         <div class="meta">${escapeHtml(n.identity.role)} · ${escapeHtml(n.identity.description || "")}</div>
-        <div class="meta">${escapeHtml(n.sessionId)}</div>`;
+        <div class="meta">${escapeHtml(n.sessionId)}</div>
+        <div class="meta">${escapeHtml(({listening:'监听正常',waking:'唤醒中',lost:'未监听或失联',unknown:'未核验'})[n.listener?.state] || '未核验')}</div>
+        <div class="meta">最近取信：${escapeHtml(n.listener?.lastSyncAt || n.lastSyncAt || '—')}</div>
+        <div class="meta">开始执行（宿主报告）：${escapeHtml(n.listener?.lastExecutionStartedAt || '—')}</div>`;
       el.addEventListener("click", () => openTerminal(n));
       $nodes.appendChild(el);
     }
@@ -154,6 +157,7 @@
       const j = await r.json();
       if (j.ok) {
         $device.textContent = `device: ${j.data.deviceId}`;
+        nodes.clear();
         for (const n of j.data.nodes) nodes.set(n.identity.nodeId, n);
         if (j.data.uplink) setUplink(j.data.uplink.connected);
         render();
@@ -185,6 +189,7 @@
   es.onerror = () => { /* 浏览器会自动重连 */ };
 
   bootstrap();
+  setInterval(bootstrap, 5000);
 })();
 </script>
 </body>

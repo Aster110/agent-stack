@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# mesh-doorbell.sh — A 层门铃：断线自愈的长轮询收信壳（事件驱动 Wake 架构定稿 §4.3）
+# mesh-doorbell.sh — 默认 exec 绑定席位/实例的 SSE 读取与 ACK 门铃。
+# Bash(run_in_background:true) 调用；只有业务提示输出一次并退出。
+# 以下长轮询说明只适用于 --drain / MESH_DOORBELL_LEGACY_SYNC=1。
 #
 # 治的病（已实证发生，不是假设）：
 #   relay 升级重启 → SSE/长连接断 → 门铃进程退出 → **无人知晓**。
@@ -36,6 +38,10 @@
 #
 # bash 3.2 兼容（macOS 默认）：不用关联数组 / ${var^^} / mapfile。
 set -u
+# Default path is the bound SSE reader. Legacy long-poll is explicit only.
+if [ "${2:-}" != "--drain" ] && [ "${MESH_DOORBELL_LEGACY_SYNC:-0}" != "1" ]; then
+  exec node "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mesh-sse-doorbell.mjs" "$@"
+fi
 
 NODE_ID="${1:-}"
 MODE="${2:-}"
@@ -128,7 +134,7 @@ if [ "$MODE" = "--drain" ]; then
   since=""
   batches=0
   while : ; do
-    set -- -sS -G "${RELAY_URL}/api/sync" \
+    set -- -sS --noproxy '*' -G "${RELAY_URL}/api/sync" \
       --data-urlencode "nodeId=${NODE_ID}" \
       --data-urlencode "timeout=0" \
       -m 30 -w $'\n%{http_code}'

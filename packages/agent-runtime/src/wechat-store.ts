@@ -28,6 +28,20 @@ export class WeChatStore {
   }
   private get(key:string):string|undefined {return (this.db.prepare('SELECT value FROM meta WHERE key=?').get(key) as {value:string}|undefined)?.value}
   private set(key:string,value:string){this.db.prepare('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value)}
+  /** One-time offline migration; refuses to overwrite a live or previously used inbox. */
+  importLegacy(cursor:string,owner:string,token:string):void {
+    this.db.transaction(()=>{
+      if(!cursor||!token||this.get('cursor')!==undefined ||
+         (this.db.prepare('SELECT count(*) AS n FROM incoming').get() as {n:number}).n ||
+         (this.db.prepare('SELECT count(*) AS n FROM delivery').get() as {n:number}).n ||
+         (this.db.prepare('SELECT count(*) AS n FROM routes').get() as {n:number}).n)
+        throw new Error('legacy import requires an unused WeChat store')
+      const identity=JSON.parse(this.get('identity')!) as string[]
+      if(identity[1]!==owner)throw new Error('legacy route owner mismatch')
+      this.set('cursor',cursor)
+      this.db.prepare('INSERT INTO routes VALUES(?,?)').run(owner,token)
+    })()
+  }
   cursor():string{return this.get('cursor')??''}
   acceptBatch(messages:WeixinMessage[],cursor:string|undefined,owner:string):void {
     this.db.transaction(()=>{

@@ -48,6 +48,7 @@ interface RelayEntry {
   deviceId: string
   ws: WebSocket
   nodes: NodeIdentity[]
+  listeners?: import("@cc-mesh/protocol").ListenerStatus[]
 }
 
 export async function createHub(opts: HubOptions = {}): Promise<HubInstance> {
@@ -97,6 +98,10 @@ export async function createHub(opts: HubOptions = {}): Promise<HubInstance> {
       deviceId: entry.deviceId,
       relayId: entry.relayId,
       nodes: entry.nodes,
+      listeners: entry.listeners?.map(s => ({ ...s,
+        validForMs: s.expiresAt ? Math.max(0, Date.parse(s.expiresAt) - Date.now()) : 0,
+        state: (s.state === 'listening' || s.state === 'waking' || s.expiresAt !== null) && (!s.expiresAt || Date.parse(s.expiresAt) <= Date.now()) ? 'lost' : s.state,
+      })),
       updatedAt,
     }))
   }
@@ -124,7 +129,7 @@ export async function createHub(opts: HubOptions = {}): Promise<HubInstance> {
     const prev = relays.get(reg.relayId)
     if (prev) for (const n of prev.nodes) nodeIndex.delete(n.nodeId)
 
-    relays.set(reg.relayId, { relayId: reg.relayId, deviceId: reg.deviceId, ws, nodes: reg.nodes })
+    relays.set(reg.relayId, { relayId: reg.relayId, deviceId: reg.deviceId, ws, nodes: reg.nodes, listeners: prev?.ws === ws ? prev.listeners?.filter(s => reg.nodes.some(n => n.nodeId === s.nodeId)) : undefined })
     wsToRelay.set(ws, reg.relayId)
     for (const n of reg.nodes) nodeIndex.set(n.nodeId, reg.relayId)
     // B8 presence 事件：上下线是"当时为什么"的上下文（孤儿判定、排障时间线都靠它）
@@ -231,6 +236,24 @@ export async function createHub(opts: HubOptions = {}): Promise<HubInstance> {
     }
   }
 
+  function handleListenerStatus(ws: WebSocket, statuses: import('@cc-mesh/protocol').ListenerStatus[]): void {
+    const id = wsToRelay.get(ws); const entry = id ? relays.get(id) : undefined
+    if (!entry || entry.ws !== ws || !Array.isArray(statuses) || statuses.length > entry.nodes.length) return
+    const t = Date.now()
+    const valid = statuses.filter(s => s && entry.nodes.some(n => n.nodeId === s.nodeId)
+      && ['listening', 'waking', 'lost', 'unknown'].includes(s.state)
+      && typeof s.validForMs === 'number' && Number.isFinite(s.validForMs))
+    entry.listeners = valid.map(s => ({
+      nodeId: s.nodeId, state: s.state, instanceId: typeof s.instanceId === 'string' ? s.instanceId : null,
+      connected: s.connected === true, lastAckAt: s.lastAckAt, lastSyncAt: s.lastSyncAt,
+      lastExecutionStartedAt: s.lastExecutionStartedAt,
+      observedAt: new Date(t).toISOString(),
+      expiresAt: s.expiresAt === null ? null : new Date(t + Math.min(60_000, Math.max(0, s.validForMs))).toISOString(),
+      validForMs: Math.min(60_000, Math.max(0, s.validForMs)),
+    }))
+    broadcastDevices()
+  }
+
   // D29: 每个连接的 ws frame ping/pong 状态（WeakMap 防内存泄漏）
   const lastPongAt = new WeakMap<WebSocket, number>()
   const pingTimers = new WeakMap<WebSocket, NodeJS.Timeout>()
@@ -261,6 +284,7 @@ export async function createHub(opts: HubOptions = {}): Promise<HubInstance> {
         case "spawn": handleSpawn(ws, parsed); break
         case "spawn_result": handleSpawnResult(parsed); break
         case "ledger": handleLedger(ws, parsed); break
+        case "listener_status": handleListenerStatus(ws, parsed.listeners); break
         case "ping": send(ws, { type: "pong" }); break
       }
     })

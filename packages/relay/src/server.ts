@@ -1,3 +1,4 @@
+import { DoorbellMonitor } from "./doorbell.js"
 import express, { type Express } from "express"
 import type { NextFunction, Request, Response } from "express"
 import { Store } from "./store.js"
@@ -30,6 +31,9 @@ import { formatAttachmentsForDelivery } from "./attachments.js"
 
 export interface ServerOptions {
   dbPath?: string
+  doorbellTtlMs?: number
+  doorbellProbeMs?: number
+  doorbellWakeMs?: number
   deviceId: string
   terminal: ITerminal
   spawnReadyTimeoutMs?: number
@@ -45,6 +49,7 @@ export interface ServerOptions {
   /** 身份软不匹配时的重试间隔 ms（缺省 env MESH_IDENTITY_RETRY_MS 或 3000；测试传 0） */
   identityRetryMs?: number
   uplink?: {
+    sendListenerStatus?(listeners: import("@cc-mesh/protocol").ListenerStatus[]): void
     isConnected(): boolean
     sendRegistration(nodes: NodeIdentity[]): Promise<void>
   }
@@ -57,6 +62,9 @@ export interface ServerOptions {
 
 export type MeshServer = Express & {
   registry: Registry
+  doorbell: DoorbellMonitor
+  publishListeners: () => void
+  closeDoorbell: () => void
   store: Store
   spawnLocal: (body: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: string }>
   /** 启动时从 SQLite 恢复进内存的节点数（给 index.ts 打启动日志用） */
@@ -96,6 +104,15 @@ export function createServer(opts: ServerOptions): MeshServer {
   })
   const store = new Store(opts.dbPath)
   const registry = new Registry()
+  const doorbell = new DoorbellMonitor(opts.doorbellTtlMs, opts.doorbellWakeMs, Date.now, opts.dbPath && opts.dbPath !== ':memory:' ? opts.dbPath + '.doorbell-fences.json' : undefined)
+  const listenerSnapshot = () => registry.getAll()
+    .filter(n => normalizeDeliveryMode(n.identity.deliveryMode) === 'pull')
+    .map(n => doorbell.status(n.identity.nodeId, registry.getLastSyncAt(n.identity.nodeId) ?? null))
+  const publishListeners = () => uplink?.sendListenerStatus?.(listenerSnapshot())
+  const listenerTimer = setInterval(publishListeners, opts.doorbellProbeMs ?? 15_000)
+  listenerTimer.unref()
+  events?.on('msg:send', data => { doorbell.message(data.to, data.msgId) })
+  events?.on('node:unregister', data => { doorbell.forget(data.nodeId); publishListeners() })
   const router = new Router(registry, deviceId)
   let activeMaterializations = 0
   const materializeQueue: Array<() => void> = []
@@ -462,7 +479,7 @@ export function createServer(opts: ServerOptions): MeshServer {
       const parkedCount = registry.getParkedCount(nodeId)
       const lastSyncAt = registry.getLastSyncAt(nodeId)
       const derived = registry.hasActiveConsumer(nodeId, PRESENCE_FRESH_MS) ? "idle" : "offline"
-      return { ...n, status: derived, parkedCount, lastSyncAt: lastSyncAt ?? null }
+      return { ...n, status: derived, parkedCount, lastSyncAt: lastSyncAt ?? null, listener: doorbell.status(nodeId, lastSyncAt ?? null) }
     })
     const uplink = opts.transport && "uplink" in opts.transport
       ? { connected: (opts.transport as any).uplink?.isConnected?.() ?? false }
@@ -879,11 +896,19 @@ ${delegatorNodeId
     const timeoutSec = Number.isFinite(timeoutNum) ? Math.max(0, Math.min(55, Math.floor(timeoutNum))) : 55
 
     // since 解析 + 即 ack 语义。
+    //
+    // ⚠️ 入口钳制（2026-09-05/08 claude-main 失聪事故）：显式 since 先钳到 head。
+    // 这个端点长得像只读 GET，实则 `since > 游标` 即**写**游标（store.ack）。事故正是
+    // 一条「试试 since>head 会返回空批还是报错」的诊断 curl 把 epoch 写进了 seq 游标
+    // ——探测行为本身成了投毒。store.ack 里已有写闸，这里再钳一道是因为 since 还兼任
+    // **本次请求 getInbox 的过滤下界**：只钳写不钳读的话，游标干净了，这一拨仍会被
+    // 荒谬的 since 坑成空批（假装「没消息」）。钳到 head 后最坏退化成「从 head 读」。
+    const head = store.headSeq()
     const cursor = store.getAckCursor(nodeId)
     const sinceRaw = req.query.since as string | undefined
     let since: number
     if (sinceRaw != null && sinceRaw !== "" && !Number.isNaN(Number(sinceRaw))) {
-      since = Number(sinceRaw)
+      since = Math.min(Number(sinceRaw), head)
       if (since > cursor) store.ack(nodeId, since) // 显式且 > 游标 → 推进游标（销账），再取
     } else {
       since = cursor // 缺省 = 服务端游标
@@ -1189,6 +1214,20 @@ ${delegatorNodeId
     res.status(500).send("dashboard.html not found")
   })
 
+  // Dedicated transport receipt: never calls sync, heartbeat, Store.ack or registration.
+  for (const action of ['ack', 'execution'] as const) {
+    app.post(`/api/doorbell/${action}`, (req: Request, res: Response) => {
+      const node = registry.get(req.body?.nodeId)
+      if (!node || normalizeDeliveryMode(node.identity.deliveryMode) !== 'pull') {
+        res.status(404).json({ ok: false, error: 'pull node not registered' }); return
+      }
+      const ok = action === 'ack' ? doorbell.ack(req.body) : doorbell.started(req.body)
+      if (!ok) { res.status(409).json({ ok: false, error: 'stale or invalid doorbell receipt' }); return }
+      publishListeners()
+      res.json({ ok: true, data: doorbell.status(req.body.nodeId, registry.getLastSyncAt(req.body.nodeId) ?? null) })
+    })
+  }
+
   // ===== SSE 事件流 =====
   if (events) {
     const EVENT_NAMES: MeshEventName[] = [
@@ -1200,12 +1239,40 @@ ${delegatorNodeId
       "wake:needed",
     ]
     app.get("/api/events", (req: Request, res: Response) => {
+      const { nodeId, instanceId } = req.query
+      const bound = nodeId !== undefined || instanceId !== undefined
+      if (bound) {
+        if (typeof nodeId !== 'string' || typeof instanceId !== 'string' || !/^[a-zA-Z0-9-]{8,100}$/.test(instanceId)) {
+          res.status(400).json({ ok: false, error: 'nodeId and instanceId required' }); return
+        }
+        const node = registry.get(nodeId)
+        if (!node) { res.status(404).json({ ok: false, error: 'node not registered' }); return }
+        if (normalizeDeliveryMode(node.identity.deliveryMode) !== 'pull' || !doorbell.canBind(nodeId, instanceId)) {
+          res.status(409).json({ ok: false, error: 'non-pull node or superseded instance' }); return
+        }
+      }
       res.setHeader("Content-Type", "text/event-stream")
       res.setHeader("Cache-Control", "no-cache")
       res.setHeader("Connection", "keep-alive")
       res.flushHeaders?.()
       res.write(": connected\n\n")
 
+      if (bound) {
+        const id = nodeId as string
+        const send = (event: string, data: Record<string, unknown>) => {
+          if (!res.destroyed) res.write(`data: ${JSON.stringify({ event, data })}\n\n`)
+        }
+        const binding = doorbell.bind(id, instanceId as string, send, () => res.end())
+        const timer = setInterval(() => doorbell.probe(id), opts.doorbellProbeMs ?? 15_000)
+        req.on('close', () => {
+          clearInterval(timer); doorbell.disconnect(id, binding.connectionId); publishListeners()
+        })
+        doorbell.probe(id)
+        // Subscribe before this read; backlog is a hint, never a cursor advance.
+        if (store.countDirectBacklog(id, store.getAckCursor(id)) > 0) doorbell.message(id)
+        publishListeners()
+        return
+      }
       const subs: Array<{ event: MeshEventName; fn: (data: any) => void }> = []
       for (const event of EVENT_NAMES) {
         const fn = (data: any) => {
@@ -1275,6 +1342,9 @@ ${delegatorNodeId
   }
 
   const meshServer = app as MeshServer
+  meshServer.doorbell = doorbell
+  meshServer.publishListeners = publishListeners
+  meshServer.closeDoorbell = () => { clearInterval(listenerTimer); doorbell.close() }
   meshServer.registry = registry
   meshServer.store = store
   meshServer.spawnLocal = spawnLocal
