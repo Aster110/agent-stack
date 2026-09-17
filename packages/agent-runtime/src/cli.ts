@@ -8,7 +8,7 @@ if(!file||!['check','run'].includes(command??'')){
 }else{
   try{
     const config=validateRuntimeConfig(JSON.parse(fs.readFileSync(file,'utf8')))
-    if(command==='check')console.log(JSON.stringify({valid:true,role:config.role,seat:config.seat,channels:config.wechat?['mesh','wechat']:['mesh']}))
+    if(command==='check')console.log(JSON.stringify({valid:true,role:config.role,seat:config.seat,channels:['mesh',...(config.wechat?['wechat']:[]),...(config.brainChannel?['brain-http']:[])],brainChannelPort:config.brainChannel?(config.brainChannel.port??18090):null}))
     else{
       const runtime=await startUnifiedRuntime(config)
       const status=await runtime.seat.status()

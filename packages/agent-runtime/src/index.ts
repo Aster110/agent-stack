@@ -6,6 +6,8 @@ import {runSeat,resolveSeatConfig,atomicWriteFileSync,type SeatRuntimeOptions,ty
 import {DurableWeChatChannel,type WeChatAccount,type WeChatApi} from './wechat.js'
 import {WeChatStore} from './wechat-store.js'
 import {RuntimeLease} from './runtime-lease.js'
+import {BrainHttpChannel,BrainHttpStore,BRAIN_HTTP_CHANNEL,DEFAULT_PORT as BRAIN_HTTP_DEFAULT_PORT} from './brain-http.js'
+import type {SeatChannel} from '@cc-mesh/codex-seat'
 
 export interface RuntimeConfig {
   version:1
@@ -21,6 +23,8 @@ export interface RuntimeConfig {
   /** This candidate retains the existing engine policy, so acknowledgement is explicit. */
   executionPolicy:'full-access'
   wechat?:{accountFile:string;ownerId:string}
+  /** Third brain channel: loopback HTTP for voice/chat clients, fronted by a tunnel. Brain role only. */
+  brainChannel?:{tokenFile:string;port?:number;stateFile?:string}
 }
 export function validateRuntimeConfig(value:unknown):RuntimeConfig {
   const c=value as RuntimeConfig
@@ -36,10 +40,25 @@ export function validateRuntimeConfig(value:unknown):RuntimeConfig {
   if(c.healthPort!==undefined&&(!Number.isInteger(c.healthPort)||c.healthPort<1||c.healthPort>65535))throw new Error('invalid healthPort')
   if(c.wechat&&(c.role!=='brain'||!path.isAbsolute(c.wechat.accountFile)||!c.wechat.ownerId))throw new Error('WeChat requires brain role, account file and explicit owner')
   if(c.wechat&&(!c.relayDatabase||!path.isAbsolute(c.relayDatabase)))throw new Error('brain needs local relayDatabase to correlate task results')
+  if(c.brainChannel){
+    if(c.role!=='brain')throw new Error('brainChannel requires brain role')
+    if(!path.isAbsolute(c.brainChannel.tokenFile))throw new Error('brainChannel.tokenFile must be absolute')
+    if(c.brainChannel.stateFile!==undefined&&!path.isAbsolute(c.brainChannel.stateFile))throw new Error('brainChannel.stateFile must be absolute')
+    const port=c.brainChannel.port
+    if(port!==undefined&&(!Number.isInteger(port)||port<1||port>65535))throw new Error('invalid brainChannel.port')
+  }
   return c
 }
 export interface RuntimeOptions {seat?:SeatRuntimeOptions;wechatApi?:WeChatApi}
-export interface UnifiedRuntime {seat:SeatHandle;wechat:DurableWeChatChannel|null;stop():Promise<void>}
+export interface UnifiedRuntime {seat:SeatHandle;wechat:DurableWeChatChannel|null;brainHttp:BrainHttpChannel|null;stop():Promise<void>}
+/** The token is a private local file: it grants owner-level conversation, so a group/world readable file is a refusal. */
+function readChannelToken(file:string):string{
+  const mode=fs.statSync(file).mode&0o777
+  if(mode&0o077)throw new Error(`brain channel token file must not be group/world accessible: ${file} is ${mode.toString(8)}`)
+  const token=fs.readFileSync(file,'utf8').trim()
+  if(token.length<16)throw new Error('brain channel token must be at least 16 characters')
+  return token
+}
 /** Same assembly for computer, server and brain. Only configuration enables WeChat. */
 export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOptions={}):Promise<UnifiedRuntime>{
   const c=validateRuntimeConfig(input)
@@ -49,6 +68,7 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
     codex:{bin:c.codex.bin,home:c.codex.home??null,model:c.codex.model,reasoningEffort:c.codex.reasoningEffort,extraArgs:[]},
     allowlist:{extra:c.peerNodes,disableDefaults:true}})
   let channel:DurableWeChatChannel|null=null
+  let brainHttp:BrainHttpChannel|null=null
   let taskDb:Database.Database|null=null
   let seat:SeatHandle|undefined
   let health:http.Server|undefined
@@ -66,6 +86,14 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
       const store=new WeChatStore(path.join(c.stateRoot,'wechat.sqlite'),account.accountId,c.wechat.ownerId)
       channel=new DurableWeChatChannel(c.wechat.ownerId,account,store,options.wechatApi)
     }
+    if(c.brainChannel){
+      brainHttp=new BrainHttpChannel({token:readChannelToken(c.brainChannel.tokenFile),
+        port:c.brainChannel.port??BRAIN_HTTP_DEFAULT_PORT,
+        store:new BrainHttpStore(c.brainChannel.stateFile??path.join(c.stateRoot,'brain-http.json'))})
+    }
+    const channels:Record<string,SeatChannel>={}
+    if(channel)channels.wechat=channel
+    if(brainHttp)channels[BRAIN_HTTP_CHANNEL]=brainHttp
     seat=await runSeat(config,{...options.seat,env:{...process.env,...options.seat?.env,MESH_RELAY_URL:c.relayUrl},homeDir:c.stateRoot,strictPersistence:true,preserveThreadOnResumeFailure:true,
       installSignalHandlers:false,
       acceptsPeer:nodeId=>c.peerNodes.includes(nodeId),
@@ -79,7 +107,8 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
         c.role==='brain'?'After dispatching work, immediately finish the current turn with a short dispatch acknowledgement. Do not block, sleep or poll for completion: the runtime queues the verified peer result as the next input in this same conversation, and you report completion in that later turn.': '',
         c.role==='brain'?'Coordinate tasks across configured peers. A later correlated task result returns to this same conversation and is reported to the owner.':'Complete assigned work in the configured workspace and return evidence.',
       ].join('\n'),
-      ...(channel?{channels:{wechat:channel},brainResultRoute:{channel:'wechat',endpointId:c.wechat!.ownerId},
+      ...(Object.keys(channels).length?{channels}:{}),
+      ...(channel?{brainResultRoute:{channel:'wechat',endpointId:c.wechat!.ownerId},
         acceptsTaskResult:({from,to,replyTo})=>{
           const row=taskDb!.prepare('SELECT "from" AS sender,"to" AS target,type,payload FROM messages WHERE id=?').get(replyTo) as {sender:string;target:string;type:string;payload:string}|undefined
           return !!row && row.sender===to && row.target===from && ['task','chat'].includes(row.type) && !row.payload.startsWith('[ctl:')
@@ -89,18 +118,21 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
         if(req.method!=='GET'||req.url!=='/health'){res.writeHead(404).end();return}
         void seat!.status().then(status=>{
           res.setHeader('Content-Type','application/json')
-          res.end(JSON.stringify({status:'running',delivery:'channel',backend:'codex-app-server',nodeId:seat!.nodeId,threadId:seat!.state().mainThreadId,engine:status.engine,queue:status.queue,wechat:channel?.health()??null}))
+          res.end(JSON.stringify({status:'running',delivery:'channel',backend:'codex-app-server',nodeId:seat!.nodeId,threadId:seat!.state().mainThreadId,engine:status.engine,queue:status.queue,wechat:channel?.health()??null,brainHttp:brainHttp?.health()??null}))
         },()=>res.writeHead(503).end())
       })
       await new Promise<void>((resolve,reject)=>{health!.once('error',reject);health!.listen(c.healthPort,'127.0.0.1',()=>{health!.off('error',reject);resolve()})})
     }
     channel?.start(seat)
+    if(brainHttp)await brainHttp.start(seat)
     let stopped=false
-    return {seat,wechat:channel,async stop(){
+    return {seat,wechat:channel,brainHttp,async stop(){
       if(stopped)return;stopped=true;health?.close()
       try{await seat!.stop('unified runtime stop')}
-      finally{try{await channel?.stop()}finally{try{taskDb?.close()}finally{lease.close()}}}
+      finally{try{await brainHttp?.stop()}finally{try{await channel?.stop()}finally{try{taskDb?.close()}finally{lease.close()}}}}
     }}
-  }catch(error){health?.close();await seat?.stop('startup failed').catch(()=>{});await channel?.stop().catch(()=>{});taskDb?.close();lease.close();throw error}
+  }catch(error){health?.close();await seat?.stop('startup failed').catch(()=>{});await brainHttp?.stop().catch(()=>{});await channel?.stop().catch(()=>{});taskDb?.close();lease.close();throw error}
 }
 export {WeChatStore,DurableWeChatChannel}
+export {BrainHttpChannel,BrainHttpStore,BRAIN_HTTP_CHANNEL} from './brain-http.js'
+export type {BrainSeat,BrainReply,BrainMessage} from './brain-http.js'

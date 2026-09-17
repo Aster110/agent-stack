@@ -125,6 +125,8 @@ accepted、HTTP 200、PID 或单元测试通过均不能替代微信与文件闭
 
 新状态适合首次安装。已有席位/主脑要保留 thread、WAL、mesh cursor、微信 cursor/owner 和待发结果。本版没有将旧 tmux/cc2wechat 主脑直接无损导入的一键命令；空 stateRoot 不算迁移，cursor=0 不能重放历史。状态导入与回滚未核验时保留旧主脑运行。
 
+已经在服务的主脑无法用 `init` 换新 profile 而不丢 thread、WAL 与游标，本仓也没有无损 profile 迁移。就地升级同一个 checkout 时，先在别的机器构建产物，停服排空，再用 `python3 scripts/deploy.py upgrade --profile <profile> --confirm-source-change` 显式重记 identity（自动留 `deployment.json.before-<旧hash>` 备份），然后重启服务；不要手改 deployment.json 绕过校验，也不要改 `source` 字段。
+
 runtime contract=6，旧二进制不能写新状态。回退使用一致备份，不让新旧桥同时轮询同一微信账号或消费同一席位。状态异常保留现场，不删除数据库“修复”。
 
 对外只分享本仓标签、源码 ZIP 和本 SOP。机器地址、SSH config、凭证、实际工作目录、会话记录及内部迁移清单不属于分享包。

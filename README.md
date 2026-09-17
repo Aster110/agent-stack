@@ -36,6 +36,20 @@ bash scripts/bootstrap.sh
 
 电脑、服务器和主脑使用 `packages/agent-runtime` 的同一个入口，由配置选择 `computer`、`server` 或 `brain`。主脑开启 `wechat`，不再另外启动 cc2wechat daemon。Hub、relay、Codex 驱动、微信 transport 都在本仓，不需访问私有仓库。
 
+主脑可选开启第三条通道 **brain HTTP channel**（语音 / 文字对话）：`runtime.json` 加 `brainChannel`，只绑 `127.0.0.1`（默认 `18090`），Bearer token 从 0600 的 `tokenFile` 读取，公网暴露由本机已有的隧道（如 cloudflared ingress）负责，本服务自己不开公网口。它与微信、mesh 共用同一条 Codex thread：语音里问的问题，微信里接着聊。接口与恢复语义见[架构与恢复契约 §12](docs/UNIFIED-RUNTIME.md#12-brain-http-channel-voicechat)。
+
+```jsonc
+// runtime.json 片段
+"brainChannel": { "tokenFile": "/root/.config/agent-stack/<profile>/brain-channel-token", "port": 18090 }
+```
+
+```yaml
+# /etc/cloudflared/config.yml 片段
+ingress:
+  - hostname: brain.example.com
+    service: http://127.0.0.1:18090
+```
+
 候选版支持微信文字和已有语音转写；媒体附件会明确回复暂不支持。动态 spawn/close/compact 控制命令的恢复契约未完成，当前禁用；固定配置的常驻席位可以互相派单。Claude App 旧适配仍保留，未验证新的完整 Claude 流程。
 
 这是同一所有者管理设备和本地进程的系统，配置明确启用 `full-access`，不是多租户托管服务。凭证、地址、身份、工作目录和会话数据库属于各自的部署配置。公开版本不会连接作者的基础设施。

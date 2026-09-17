@@ -90,6 +90,35 @@ def initialize(a, profile):
     print('Then: python3 scripts/deploy.py install --profile '+str(profile))
 
 
+def upgrade(profile, confirmed):
+    """Re-record source identity for an existing profile after an intentional in-place source change.
+
+    `execute` refuses to start a service whose checkout drifted from the recorded hash, which is the
+    guard against silent drift. A brain that already owns a Codex thread, WAL, mesh and WeChat cursors
+    cannot be re-`init`ed into a new profile without abandoning that state, and this repository has no
+    lossless profile migration. So an intentional upgrade is an explicit, recorded operation here
+    rather than an edit of deployment.json by hand. Paths, services and state are untouched.
+    """
+    config = load(profile)
+    if not confirmed:
+        raise ValueError('Re-recording source identity is intentional: pass --confirm-source-change.')
+    current, recorded = identity(), config['identity']
+    if current['sourceHash'] == recorded['sourceHash']:
+        print('Source identity already matches; nothing to re-record.')
+        return
+    backup = profile/('deployment.json.before-'+recorded['sourceHash'][:12])
+    if not backup.exists():
+        shutil.copyfile(profile/'deployment.json', backup)
+        os.chmod(backup, 0o600)
+    config['identity'] = current
+    (profile/'deployment.json').write_text(json.dumps(config, indent=2)+'\n', encoding='utf-8')
+    os.chmod(profile/'deployment.json', 0o600)
+    print(json.dumps({'profile': str(profile), 'backup': str(backup),
+                      'from': {k: recorded.get(k) for k in ('release', 'commit', 'sourceHash')},
+                      'to': {k: current.get(k) for k in ('release', 'commit', 'sourceHash')},
+                      'next': 'restart the affected services when no turn is in flight'}, ensure_ascii=False))
+
+
 def execute(profile, service):
     config = load(profile)
     if identity()['sourceHash'] != config['identity']['sourceHash']:
@@ -168,7 +197,7 @@ def supervisors(profile, action, render_only=False):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command',choices=['init','run','install','status','stop'])
+    p.add_argument('command',choices=['init','run','install','status','stop','upgrade'])
     p.add_argument('--profile',required=True)
     p.add_argument('--role',choices=['brain','computer','server'],default='computer')
     p.add_argument('--device',default='computer')
@@ -182,6 +211,7 @@ def main():
     p.add_argument('--ssh')
     p.add_argument('--service',choices=['hub','tunnel','relay','runtime'])
     p.add_argument('--render-only',action='store_true')
+    p.add_argument('--confirm-source-change',action='store_true')
     a=p.parse_args()
     profile=pathlib.Path(a.profile)
     if not profile.is_absolute() or ROOT == profile or ROOT in profile.parents:
@@ -195,6 +225,8 @@ def main():
     elif a.command=='run':
         if not a.service:p.error('run requires --service')
         execute(profile,a.service)
+    elif a.command=='upgrade':
+        upgrade(profile,a.confirm_source_change)
     else: supervisors(profile,a.command,a.render_only)
 
 

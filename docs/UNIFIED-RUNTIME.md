@@ -100,6 +100,42 @@ No 48-hour stability claim from accelerated tests. Original live services and us
 
 Keep codex-seat existing regression suite. Add independent failure cases: channel/mesh same thread; duplicate replay across restart; intake crash before cursor; lost final reply retry with no extra model turn; channel restart preserves brain; role-specific task result semantics without loops; source route survives restart; shutdown drains safely; corrupt state fails visibly. Verify artifact hashes and paths. Do not use mock success to claim real WeChat phone delivery.
 
+## 12. Brain HTTP channel (voice/chat)
+
+Third optional brain ingress beside WeChat and mesh, in `packages/agent-runtime/src/brain-http.ts`.
+It is transport only, under the same §5 boundary as the WeChat adapter: no model process, no thread
+selection, no new authority. Voice clients and the chat page reach the brain through it, and every
+turn lands in the same Codex thread WeChat uses, so the owner can start a question by voice and
+continue it on the phone.
+
+| Item | Value |
+|---|---|
+| Config | `brainChannel: {tokenFile, port?, stateFile?}` in `runtime.json`; brain role only |
+| Bind | `127.0.0.1` only, default port `18090`; public exposure is the operator's tunnel, not this server |
+| Auth | `Authorization: Bearer <token>`; token read from `tokenFile`, which must not be group/world readable |
+| Durable state | `stateFile` (default `<stateRoot>/brain-http.json`): open turns, uncollected finals, per-session transcript |
+| Wire contract | `POST /v1/brain/ask` (SSE `accepted`/`delta`/`final`/`pending`/`error`), `GET /v1/brain/replies`, `GET /v1/brain/health`, `GET /v1/brain/history` |
+
+Endpoints are `voice:<sessionId>` and `chat:<sessionId>`; `accepts()` admits that namespace and
+nothing else, so a WAL replay after restart still finds a valid reply route. The seat hashes the
+endpoint into `from`, so the channel prefixes the delivered text with `[voice:<sessionId>]` /
+`[chat:<sessionId>]`; the stored transcript keeps the owner's own words without that tag.
+
+`waitSec` (1-90, default 45) bounds how long the caller holds the stream. On expiry the channel sends
+`pending` and closes; the answer the model later produces is persisted and collected once by
+`/v1/brain/replies` (take-and-destroy). Replies are persisted before they are streamed, so a socket
+that dies mid-write loses nothing; the cost is that a crash between streaming and dequeuing can show
+one answer twice, which is the same platform-receipt ambiguity §3 already accepts for WeChat.
+
+The brain runs one thread serially, so a second `ask` while a turn is in flight is accepted with
+`queued:true` rather than refused. Input is capped at 4000 characters. Logs record turn ID, kind and
+character counts, never message text.
+
+Security boundary: the token buys the right to talk to the brain as its owner — equivalent to the
+WeChat account being stolen, no more. It grants the brain no new execution authority, and the channel
+does not go through the mesh allowlist because it is not a mesh peer.
+
+
 ## 11. Review
 
 Fresh reviewer must examine the eight anti-overdesign risks from arch-design against this document and code, identify any unsafe contract or unnecessary duplicate queue/engine, and give a concrete decision. This is a candidate design subject to test evidence, not a final release claim.
