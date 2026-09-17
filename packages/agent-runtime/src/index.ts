@@ -89,7 +89,9 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
     if(c.brainChannel){
       brainHttp=new BrainHttpChannel({token:readChannelToken(c.brainChannel.tokenFile),
         port:c.brainChannel.port??BRAIN_HTTP_DEFAULT_PORT,
-        store:new BrainHttpStore(c.brainChannel.stateFile??path.join(c.stateRoot,'brain-http.json'))})
+        store:new BrainHttpStore(c.brainChannel.stateFile??path.join(c.stateRoot,'brain-http.json')),
+        // Operable without being a transcript: turn, kind and size go to the service log, never the text.
+        log:record=>console.log(JSON.stringify({component:'brain-http',...record}))})
     }
     const channels:Record<string,SeatChannel>={}
     if(channel)channels.wechat=channel
