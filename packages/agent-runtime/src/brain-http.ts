@@ -20,7 +20,12 @@ const MAX_SESSIONS=200
 const MAX_TURNS=2000
 
 /** Only what this channel needs from the seat, so the contract is testable without an engine. */
-export interface BrainSeat {readonly nodeId:string;deliver(input:ChannelInput):'accepted'|'duplicate'}
+export interface BrainSeat {
+  readonly nodeId:string
+  deliver(input:ChannelInput):'accepted'|'duplicate'
+  /** The brain runs one thread for every door, so "am I behind someone" must count WeChat and mesh too. */
+  inFlightWork?():number
+}
 export interface BrainReply {turnId:string;text:string;at:string}
 export interface BrainMessage {turnId:string;role:'user'|'brain';text:string;at:string}
 interface StoredTurn {turnId:string;endpointId:string;at:string;settledAt?:string}
@@ -148,11 +153,12 @@ export class BrainHttpChannel implements SeatChannel {
     this.opts.store.queueReply(endpointId,turnId,output.text)
     this.opts.store.flush()
     const event=output.kind==='done'?{type:'final',turnId,text:output.text}:{type:'error',turnId,message:output.text}
-    if(this.emit(msgId,event)){
+    const streamed=this.emit(msgId,event)
+    if(streamed){
       this.opts.store.dequeueReply(turnId)
       try{this.opts.store.flush()}catch(error){this.log({event:'brain-http-dequeue-failed',turnId,error:String(error)})}
     }
-    this.log({event:'brain-http-reply',turnId,kind:output.kind,chars:[...output.text].length,streamed:!this.opts.store.pendingReplies()})
+    this.log({event:'brain-http-reply',turnId,kind:output.kind,chars:[...output.text].length,streamed})
   }
 
   async start(seat:BrainSeat):Promise<void>{
@@ -259,7 +265,8 @@ export class BrainHttpChannel implements SeatChannel {
     const endpointId=`${source}:${sessionId}`
     const turnId=randomUUID()
     const msgId=BrainHttpChannel.messageId(endpointId,turnId)
-    const queued=this.opts.store.inFlight()>0
+    // Not "another HTTP ask is running": anything the brain is already doing puts this caller in line.
+    const queued=(seat.inFlightWork?.()??this.opts.store.inFlight())>0
     this.opts.store.openTurn(msgId,turnId,endpointId,text)
     this.opts.store.flush()
     // The seat hashes the endpoint into `from`, so the brain only learns which session is talking

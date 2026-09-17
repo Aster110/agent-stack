@@ -118,6 +118,8 @@ export interface SeatHandle {
   drain(): Promise<void>
   /** Synchronous durable acceptance, before the transport advances its cursor. */
   deliver(input: ChannelInput): "accepted" | "duplicate"
+  /** Active plus queued inputs across every channel and the mesh. The cheap part of status(): no WAL fold. */
+  inFlightWork(): number
   stop(reason?: string): Promise<void>
 }
 
@@ -240,6 +242,7 @@ class Seat implements SeatHandle {
   get nodeId(): string { return this.st.nodeId }
   get instanceId(): string { return this.st.instanceId }
   state(): StateFile { return this.st }
+  inFlightWork(): number { return this.inflight }
 
   deliver(input: ChannelInput): "accepted" | "duplicate" {
     if (this.stopped || !this.registered || !this.st) throw new Error("seat is not accepting messages")

@@ -127,8 +127,11 @@ endpoint into `from`, so the channel prefixes the delivered text with `[voice:<s
 that dies mid-write loses nothing; the cost is that a crash between streaming and dequeuing can show
 one answer twice, which is the same platform-receipt ambiguity §3 already accepts for WeChat.
 
-The brain runs one thread serially, so a second `ask` while a turn is in flight is accepted with
-`queued:true` rather than refused. Input is capped at 4000 characters. Logs record turn ID, kind and
+The brain runs one thread serially for every door, so `accepted` carries `queued:true` whenever the
+seat already has work in flight — from WeChat or a mesh peer as much as from another `ask`. A caller
+told `queued:false` while the brain is mid-task for someone else would be misled into expecting a
+fast answer; `SeatHandle.inFlightWork()` is the cheap admission counter that keeps that flag honest
+(`status()` folds the WAL and is too expensive per request). Asks are queued, never refused. Input is capped at 4000 characters. Logs record turn ID, kind and
 character counts, never message text.
 
 Security boundary: the token buys the right to talk to the brain as its owner — equivalent to the

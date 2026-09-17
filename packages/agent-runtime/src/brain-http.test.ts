@@ -14,11 +14,15 @@ class FakeSeat implements BrainSeat {
   readonly nodeId='s1:brain'
   readonly delivered:ChannelInput[]=[]
   accept:'accepted'|'duplicate'|'throw'='accepted'
+  /** Work the seat is already doing, from any channel — not only this one. */
+  otherWork=0
   deliver(input:ChannelInput):'accepted'|'duplicate'{
     if(this.accept==='throw')throw new Error('seat is not accepting messages')
     this.delivered.push(input)
     return this.accept
   }
+  inFlightWork():number{return this.otherWork+this.delivered.filter((_,i)=>!this.settled.has(i)).length}
+  readonly settled=new Set<number>()
 }
 
 interface Harness {
@@ -44,6 +48,7 @@ async function harness(t:any,opts:{token?:string}={}):Promise<Harness>{
     async reply(index:number,text:string,kind:ChannelOutput['kind']='done'){
       const input=seat.delivered[index]
       if(!input)throw new Error('no delivery at index '+index)
+      seat.settled.add(index)
       await channel.send(input.endpointId,{id:`${BrainHttpChannel.messageId(input.endpointId,input.id)}:${kind}`,kind,text})
     }}
 }
@@ -240,6 +245,25 @@ test('unknown routes and methods are refused after auth', async t=>{
   const h=await harness(t)
   assert.equal((await get(h,'/v1/brain/nope')).status,404)
   assert.equal((await fetch(`${h.base}/v1/brain/ask`,{headers:{Authorization:`Bearer ${TOKEN}`}})).status,404)
+})
+
+test('queued counts what the brain is already doing on any channel, not just HTTP asks', async t=>{
+  const h=await harness(t)
+  // Nothing from this channel is in flight, but the brain is mid-turn for WeChat or a mesh peer.
+  h.seat.otherWork=1
+  const response=await ask(h,{sessionId:'s-11',text:'插队问一句',source:'voice',waitSec:1})
+  const events=await readSse(response)
+  assert.equal(events[0]!.type,'accepted')
+  assert.equal(events[0]!.queued,true,'a caller behind WeChat work must not be told the brain is free')
+})
+
+test('a seat without the cheap counter still answers, falling back to this channel own turns', async t=>{
+  const h=await harness(t)
+  delete (h.seat as any).inFlightWork
+  const response=await ask(h,{sessionId:'s-12',text:'降级路径',source:'chat',waitSec:1})
+  const events=await readSse(response)
+  assert.equal(events[0]!.queued,false)
+  assert.equal(h.seat.delivered.length,1)
 })
 
 async function until(fn:()=>boolean,why:string):Promise<void>{
