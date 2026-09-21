@@ -102,6 +102,7 @@ export interface RealAppServerClientOptions {
 }
 
 interface ActiveTurn {
+  msgId: string
   threadId: string
   turnId: string | null
   sentAt: number
@@ -417,6 +418,7 @@ export class RealAppServerClient implements IAppServerClient {
     })
 
     const at: ActiveTurn = {
+      msgId: req.msgId,
       threadId: req.threadId,
       turnId: null,
       sentAt: this.now(),
@@ -527,9 +529,23 @@ export class RealAppServerClient implements IAppServerClient {
     if (!turn) return { status: "unknown" }
     turnId = turn.id
     if (turn.status === "inProgress") return { status: "running", turnId }
-    if (turn.status === "completed") return { status: "completed", turnId, finalText: lastAgentMessageOf(turn.items), wallMs: 0, startedMs: 0 }
-    if (turn.status === "failed") return { status: "failed", turnId, message: turn.error?.message ?? "turn failed", wallMs: 0 }
-    if (turn.status === "interrupted") return { status: "interrupted", turnId, wallMs: 0 }
+    const settleSnapshot = (outcome: TurnOutcome): TurnOutcome => {
+      // The seat can release its thread lock after this read. Retire the exact
+      // client handle too, otherwise a pre-ACK handle would capture the next
+      // turn's notifications as its own early notifications.
+      const active = (this.turns.get(threadId) ?? []).find((at) => !at.settled && (at.turnId === turnId || (!at.turnId && !!msgId && at.msgId === msgId)))
+      if (active) {
+        this.assignTurnId(active, turnId)
+        active.accepted = true
+        active.startedMs ??= this.now() - active.sentAt
+        active.resolveStarted({ turnId, at: this.now() })
+        this.settle(active, outcome)
+      }
+      return outcome
+    }
+    if (turn.status === "completed") return settleSnapshot({ status: "completed", turnId, finalText: lastAgentMessageOf(turn.items), wallMs: 0, startedMs: 0 })
+    if (turn.status === "failed") return settleSnapshot({ status: "failed", turnId, message: turn.error?.message ?? "turn failed", wallMs: 0 })
+    if (turn.status === "interrupted") return settleSnapshot({ status: "interrupted", turnId, wallMs: 0 })
     return { status: "unknown" }
   }
 

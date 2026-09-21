@@ -61,6 +61,7 @@ export interface ScriptedServerScript {
   /** 前几次提交被独立 Compact turn 占用；模拟 ACK 前到达的外来通知。 */
   compactBusyAttempts?: number
   turnAckDelayMs?: number
+  firstTurnAckDelayMs?: number
   dropCompleted?: boolean
   turn: ScriptedTurn
 }
@@ -224,7 +225,8 @@ function main(): void {
         const turnId = `tu-${++turnSeq}`
         const threadId = String(msg.params?.threadId ?? "")
         turnSnapshots.set(turnId, { id: turnId, status: "inProgress", items: [{ type: "userMessage", content: msg.params?.input ?? [] }] })
-        if (script.turnAckDelayMs) setTimeout(() => reply(msg.id, { turn: { id: turnId, status: "inProgress", items: [] } }), script.turnAckDelayMs)
+        const ackDelay = turnSeq === 1 ? (script.firstTurnAckDelayMs ?? script.turnAckDelayMs) : script.turnAckDelayMs
+        if (ackDelay) setTimeout(() => reply(msg.id, { turn: { id: turnId, status: "inProgress", items: [] } }), ackDelay)
         else reply(msg.id, { turn: { id: turnId, status: "inProgress", items: [] } })
         runTurn(threadId, turnId)
         return

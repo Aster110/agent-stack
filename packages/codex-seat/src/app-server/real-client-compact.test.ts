@@ -80,6 +80,23 @@ test("read-only recovery finds a pre-ACK submission by durable task marker and r
   } finally { await r.close() }
 })
 
+test("snapshot retires pre-ACK handle so the next turn and late first ACK stay independent", async () => {
+  const r = await rig({ firstTurnAckDelayMs: 1000 }, true, 40)
+  try {
+    const first = await r.client.turnStart({ threadId: r.thread.threadId, text: "first [mesh-task-id:first]", nonce: "first", msgId: "first", timeoutMs: 0 })
+    await delay(130)
+    assert.equal((await r.client.readTurn(r.thread.threadId, "unknown", "first")).status, "completed")
+    assert.equal((await first.done).status, "completed")
+    const second = await r.client.turnStart({ threadId: r.thread.threadId, text: "second", nonce: "second", msgId: "second", timeoutMs: 0 })
+    const result = await Promise.race([second.done, delay(400).then(() => ({ status: "stuck" }))])
+    assert.equal(result.status, "completed", "second turn must not wait for old ACK or another observation threshold")
+    await delay(1000)
+    assert.equal(r.received("turn/start").length, 2)
+    assert.equal(r.received("turn/interrupt").length, 0)
+    assert.equal(r.client.isAlive(), true)
+  } finally { await r.close() }
+})
+
 test("Compact busy retries only unaccepted input and binds pre-ACK events to the business turn", async () => {
   const r = await rig({ compactBusyAttempts: 1, turnAckDelayMs: 20 })
   try {
