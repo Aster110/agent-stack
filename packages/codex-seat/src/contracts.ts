@@ -238,7 +238,7 @@ export interface SeatConfig {
     replayStormThreshold?: number
   }
   turn: {
-    /** 单轮墙钟上限，超时 turn/interrupt + [failed] reason=timeout */
+    /** Observation threshold; elapsed time never interrupts or fails a business turn. */
     timeoutMs: number
   }
   log: {
@@ -413,6 +413,9 @@ export type WalOp =
   | "fetched"     // 从 /api/sync 取到并落盘（此后才允许推进 since）
   | "submitting"  // Durable intent BEFORE turn/start RPC; after crash outcome is uncertain, never replay blindly.
   | "routed"      // Verified terminal result return route, persisted before queueing.
+  | "observing"
+  | "active"
+  | "observation-sent"
   | "started"     // 收到 turn/started（先写这条，再发 [seen]）
   | "completed"   // 收到 turn/completed（先写正文，再发 [done]）
   | "receipted"   // 终态回执已发出（可从 WAL 折叠删除）
@@ -447,7 +450,7 @@ export interface WalEntry {
 }
 
 /** WAL 折叠后的单条消息状态 */
-export type WalPhase = "fetched" | "started" | "completed" | "failed" | "rejected" | "done"
+export type WalPhase = "fetched" | "started" | "observing" | "completed" | "failed" | "rejected" | "done"
 export interface WalFolded {
   msgId: string
   seq: number
@@ -467,11 +470,14 @@ export interface WalFolded {
   reason?: FailReason
   detail?: string
   fetchedAt: string
+  confirmationRequested?: boolean
+  observationSent?: boolean
 }
 
 /** Pending terminal records remain until receipted; legacy terminal records remain readable. */
 export function foldWal(entries: readonly WalEntry[]): Map<string, WalFolded> {
   const out = new Map<string, WalFolded>()
+  const legacyTimeouts = new Set<string>()
   for (const e of entries) {
     const cur = out.get(e.msgId)
     if (e.op === "fetched") {
@@ -481,6 +487,21 @@ export function foldWal(entries: readonly WalEntry[]): Map<string, WalFolded> {
     if (!cur) continue // 没有 fetched 的孤儿事件：忽略（文件截断/手改）
     if (e.replyRoute) cur.replyRoute = e.replyRoute
     if (e.op === "routed") continue
+    if (e.op === "receipted" && legacyTimeouts.has(e.msgId)) continue
+    if (e.op === "completed" || (e.op === "failed" && e.reason !== "timeout")) legacyTimeouts.delete(e.msgId)
+    if (["started", "submitting", "active", "observing", "observation-sent"].includes(e.op) && ["completed", "failed", "rejected", "done"].includes(cur.phase)) continue
+    if (e.op === "observation-sent") { cur.observationSent = true; continue }
+    if (e.op === "observing" || (e.op === "failed" && e.reason === "timeout")) {
+      if (!["completed", "failed", "rejected", "done"].includes(cur.phase)) {
+        if (e.op === "failed") legacyTimeouts.add(e.msgId)
+        cur.phase = "observing"
+        cur.threadId = e.threadId ?? cur.threadId
+        cur.turnId = e.turnId ?? cur.turnId
+        if (e.op === "observing") cur.confirmationRequested = true
+      }
+      continue
+    }
+    if (e.op === "active") { if (cur.phase === "observing") cur.phase = "started"; cur.observationSent = false; continue }
     if (e.op === "submitting") { cur.phase = "started"; cur.threadId = e.threadId; continue }
     if (e.op === "started") { cur.phase = "started"; cur.threadId = e.threadId; cur.turnId = e.turnId; continue }
     if (e.op === "completed") { cur.phase = "completed"; cur.finalText = e.finalText ?? ""; cur.turnId = e.turnId ?? cur.turnId; continue }
@@ -535,6 +556,7 @@ export type FailReason =
 export type RejectReason = "sender-not-allowed" | "stale-before-seat-birth"
 
 export type Receipt =
+  | { kind: "observation"; nonce: string; node: string; thread: string; turn: string; state: "awaiting_confirmation" | "running" }
   | { kind: "seen"; nonce: string; node: string; thread: string; t: string }
   | { kind: "done"; nonce: string; node: string; thread: string; ms: number; body: string }
   | { kind: "failed"; nonce: string; node: string; reason: FailReason; detail: string }
@@ -556,6 +578,8 @@ export function shortDetail(s: string, max = 200): string {
 
 export function formatReceipt(r: Receipt): string {
   switch (r.kind) {
+    case "observation":
+      return `[observation] nonce=${r.nonce} node=${r.node} thread=${r.thread} turn=${r.turn} state=${r.state}`
     case "seen":
       return `[seen] nonce=${r.nonce} node=${r.node} thread=${r.thread} t=${r.t}`
     case "done":
@@ -577,6 +601,7 @@ export function parseReceipt(text: string): Receipt | null {
   const head = (nl === -1 ? text : text.slice(0, nl)).replace(/\r$/, "")
   const body = nl === -1 ? "" : text.slice(nl + 1)
   let m: RegExpExecArray | null
+  if ((m = /^\[observation\] nonce=(\S+) node=(\S+) thread=(\S+) turn=(\S+) state=(awaiting_confirmation|running)$/.exec(head))) return { kind: "observation", nonce: m[1]!, node: m[2]!, thread: m[3]!, turn: m[4]!, state: m[5] as "awaiting_confirmation" | "running" }
   if ((m = RECEIPT_SEEN_RE.exec(head))) return { kind: "seen", nonce: m[1]!, node: m[2]!, thread: m[3]!, t: m[4]! }
   if ((m = RECEIPT_DONE_RE.exec(head))) return { kind: "done", nonce: m[1]!, node: m[2]!, thread: m[3]!, ms: Number(m[4]), body }
   if ((m = RECEIPT_FAILED_RE.exec(head))) return { kind: "failed", nonce: m[1]!, node: m[2]!, reason: m[3] as FailReason, detail: m[4]! }
@@ -847,6 +872,7 @@ export interface TurnHandle {
 export type ThreadStatusKind = "notLoaded" | "idle" | "active" | "systemError"
 
 export type EngineEvent =
+  | { type: "request.unresponsive"; threadId: string; msgId: string }
   | { type: "turn.started"; threadId: string; turnId: string; at: number }
   | { type: "turn.completed"; threadId: string; turnId: string; status: "completed" | "failed" | "interrupted" | "inProgress"; finalText: string | null; errorMessage: string | null; durationMs: number | null; at: number }
   | { type: "item.completed"; threadId: string; turnId: string | null; itemType: string; server: string | null; tool: string | null; status: string | null }
@@ -933,6 +959,8 @@ export interface IAppServerClient {
   threadResume(req: ThreadResumeRequest): Promise<ThreadInfo>
   /** 同一 thread 上调用方必须串行（turn/start 打在 active thread 上会被当成 steer）。 */
   turnStart(req: TurnStartRequest): Promise<TurnHandle>
+  /** Read-only recovery of the original execution, including uncertain submission ACKs. */
+  readTurn?(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown" }>
   turnInterrupt(threadId: string, turnId: string): Promise<void>
   compact(threadId: string, timeoutMs: number): Promise<CompactOutcome>
   loadedThreads(): Promise<string[]>

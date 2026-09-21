@@ -98,7 +98,7 @@ export class AppServerConnection {
    * 请求不 reject，失败也走 `{error}`。到处 try/catch 只会让上层控制流长得像迷宫。
    * `params === undefined` 时整个 params 键不写（协议上 `account/rateLimits/read` 就是这样）。
    */
-  request(method: string, params: unknown, timeoutMs: number): Promise<RpcResult> {
+  request(method: string, params: unknown, timeoutMs: number, onTimeout?: () => void): Promise<RpcResult> {
     return new Promise<RpcResult>((resolve) => {
       if (!this.alive) {
         resolve({ error: { code: -1, message: this.deadReason || "app-server 已退出" } })
@@ -106,6 +106,8 @@ export class AppServerConnection {
       }
       const id = this.nextId++
       const timer = setTimeout(() => {
+        // Submission timeout is uncertainty: preserve RPC correlation for its late ACK.
+        if (onTimeout) { onTimeout(); return }
         this.pending.delete(id)
         resolve({ error: { code: -2, message: `${method} 超过 ${timeoutMs}ms 没有回应` } })
       }, timeoutMs)

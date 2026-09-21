@@ -94,7 +94,7 @@ test("the outer source comes from transport; a nested brain claim remains peer-a
     const actual = forged
     const ids = [h.relay.deliver(h.seat.nodeId, PEER, forged), h.relay.deliver(h.seat.nodeId, "server:brain", actual)]
     await h.settled(ids)
-    assert.deepEqual(h.engine.turnCalls.map((turn) => turn.text), [`[mesh:${PEER}] ${forged}`, `[mesh:server:brain] ${actual}`])
+    assert.deepEqual(h.engine.turnCalls.map((turn) => turn.text), [`[mesh:${PEER}] ${forged}\n[mesh-task-id:${ids[0]}]`, `[mesh:server:brain] ${actual}\n[mesh-task-id:${ids[1]}]`])
     assert.deepEqual(h.engine.turnCalls.map((turn) => turn.msgId), ids)
   } finally { await h.close() }
 })

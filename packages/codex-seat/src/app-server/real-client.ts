@@ -102,6 +102,7 @@ export interface RealAppServerClientOptions {
 }
 
 interface ActiveTurn {
+  msgId: string
   threadId: string
   turnId: string | null
   sentAt: number
@@ -417,6 +418,7 @@ export class RealAppServerClient implements IAppServerClient {
     })
 
     const at: ActiveTurn = {
+      msgId: req.msgId,
       threadId: req.threadId,
       turnId: null,
       sentAt: this.now(),
@@ -475,7 +477,9 @@ export class RealAppServerClient implements IAppServerClient {
           input: [{ type: "text", text: req.text, text_elements: [] }],
           approvalPolicy: TURN_BYPASS.approvalPolicy,
           sandboxPolicy: TURN_BYPASS.sandboxPolicy,
-        }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS)
+        }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS, req.timeoutMs === 0
+          ? () => this.emit({ type: "request.unresponsive", threadId: req.threadId, msgId: req.msgId })
+          : undefined)
         if (ack.error) {
           at.earlyNotifications = []
           if (ack.error.code === -32603 && /ActiveTurnNotSteerable\s*\{\s*turn_kind:\s*Compact\s*\}/.test(ack.error.message)) {
@@ -513,6 +517,36 @@ export class RealAppServerClient implements IAppServerClient {
     if (!conn?.alive) return
     // 发的是**请求**（带 id）而不是通知：协议里 turn/interrupt 属于 ClientRequest。
     await conn.request("turn/interrupt", { threadId, turnId }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS)
+  }
+
+  async readTurn(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown" }> {
+    const r = await this.requireConn().request("thread/read", { threadId, includeTurns: true }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS)
+    if (r.error) return { status: "unknown" }
+    const matches = (r.result?.thread?.turns ?? []).filter((t: { id: string; items?: Array<{ type: string }> }) => turnId !== "unknown"
+      ? t.id === turnId
+      : !!msgId && (t.items ?? []).some((i) => i.type === "userMessage" && JSON.stringify(i).includes(`[mesh-task-id:${msgId}]`)))
+    const turn = matches.length === 1 ? matches[0] : null
+    if (!turn) return { status: "unknown" }
+    turnId = turn.id
+    if (turn.status === "inProgress") return { status: "running", turnId }
+    const settleSnapshot = (outcome: TurnOutcome): TurnOutcome => {
+      // The seat can release its thread lock after this read. Retire the exact
+      // client handle too, otherwise a pre-ACK handle would capture the next
+      // turn's notifications as its own early notifications.
+      const active = (this.turns.get(threadId) ?? []).find((at) => !at.settled && (at.turnId === turnId || (!at.turnId && !!msgId && at.msgId === msgId)))
+      if (active) {
+        this.assignTurnId(active, turnId)
+        active.accepted = true
+        active.startedMs ??= this.now() - active.sentAt
+        active.resolveStarted({ turnId, at: this.now() })
+        this.settle(active, outcome)
+      }
+      return outcome
+    }
+    if (turn.status === "completed") return settleSnapshot({ status: "completed", turnId, finalText: lastAgentMessageOf(turn.items), wallMs: 0, startedMs: 0 })
+    if (turn.status === "failed") return settleSnapshot({ status: "failed", turnId, message: turn.error?.message ?? "turn failed", wallMs: 0 })
+    if (turn.status === "interrupted") return settleSnapshot({ status: "interrupted", turnId, wallMs: 0 })
+    return { status: "unknown" }
   }
 
   // ---- 账号 / 额度 --------------------------------------------------------

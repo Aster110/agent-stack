@@ -9,7 +9,7 @@ import type { ScriptedServerScript } from "./scripted-server.js"
 
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)) }
 
-async function rig(script: Partial<ScriptedServerScript>, wait: boolean | ((ms: number) => Promise<void>) = true) {
+async function rig(script: Partial<ScriptedServerScript>, wait: boolean | ((ms: number) => Promise<void>) = true, requestTimeoutMs = 8000) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-seat-compact-"))
   const trace = path.join(dir, "trace.jsonl")
   const scriptPath = path.join(dir, "script.json")
@@ -24,7 +24,7 @@ async function rig(script: Partial<ScriptedServerScript>, wait: boolean | ((ms: 
   )
   const client = new RealAppServerClient({
     cwd: dir, bin, pidFile: path.join(dir, "app-server.pid"),
-    initializeTimeoutMs: 8000, threadOpTimeoutMs: 8000, shutdownGraceMs: 300,
+    initializeTimeoutMs: 8000, threadOpTimeoutMs: requestTimeoutMs, shutdownGraceMs: 300,
     seat: "compact-test", instanceId: "compact-test-instance",
     // Compress retry waits through the existing clock seam so one deadline test
     // can cover several attempts without depending on the production backoff value.
@@ -46,6 +46,56 @@ async function rig(script: Partial<ScriptedServerScript>, wait: boolean | ((ms: 
     throw error
   }
 }
+
+test("business RPC timeout keeps process alive, original request registered, and accepts late ACK/result", async () => {
+  const r = await rig({ turnAckDelayMs: 250 }, true, 40)
+  try {
+    const events: string[] = []
+    r.client.onEvent((e) => events.push(e.type))
+    const handle = await r.client.turnStart({ threadId: r.thread.threadId, text: "late", nonce: "late", msgId: "late", timeoutMs: 0 })
+    await delay(120)
+    assert.ok(events.includes("request.unresponsive"))
+    assert.equal(r.client.isAlive(), true)
+    process.kill(r.client.info()!.pid, 0)
+    assert.equal(r.received("turn/interrupt").length, 0)
+    const outcome = await handle.done
+    assert.equal(outcome.status, "completed")
+    assert.equal(outcome.status === "completed" && outcome.finalText, "BUSINESS-OK")
+    assert.equal(r.received("turn/start").length, 1)
+    assert.equal(r.received("turn/interrupt").length, 0)
+  } finally { await r.close() }
+})
+
+test("read-only recovery finds a pre-ACK submission by durable task marker and reads a lost terminal notification", async () => {
+  const r = await rig({ turnAckDelayMs: 250, dropCompleted: true }, true, 40)
+  try {
+    await r.client.turnStart({ threadId: r.thread.threadId, text: "recover [mesh-task-id:original-task]", nonce: "recover", msgId: "original-task", timeoutMs: 0 })
+    await delay(130)
+    const result = await r.client.readTurn(r.thread.threadId, "unknown", "original-task")
+    assert.equal(result.status, "completed")
+    assert.equal(result.status === "completed" && result.finalText, "BUSINESS-OK")
+    assert.equal(await r.client.readTurn(r.thread.threadId, "unknown", "other-task").then((r) => r.status), "unknown")
+    assert.equal(r.received("turn/start").length, 1)
+    assert.equal(r.received("turn/interrupt").length, 0)
+  } finally { await r.close() }
+})
+
+test("snapshot retires pre-ACK handle so the next turn and late first ACK stay independent", async () => {
+  const r = await rig({ firstTurnAckDelayMs: 1000 }, true, 40)
+  try {
+    const first = await r.client.turnStart({ threadId: r.thread.threadId, text: "first [mesh-task-id:first]", nonce: "first", msgId: "first", timeoutMs: 0 })
+    await delay(130)
+    assert.equal((await r.client.readTurn(r.thread.threadId, "unknown", "first")).status, "completed")
+    assert.equal((await first.done).status, "completed")
+    const second = await r.client.turnStart({ threadId: r.thread.threadId, text: "second", nonce: "second", msgId: "second", timeoutMs: 0 })
+    const result = await Promise.race([second.done, delay(400).then(() => ({ status: "stuck" }))])
+    assert.equal(result.status, "completed", "second turn must not wait for old ACK or another observation threshold")
+    await delay(1000)
+    assert.equal(r.received("turn/start").length, 2)
+    assert.equal(r.received("turn/interrupt").length, 0)
+    assert.equal(r.client.isAlive(), true)
+  } finally { await r.close() }
+})
 
 test("Compact busy retries only unaccepted input and binds pre-ACK events to the business turn", async () => {
   const r = await rig({ compactBusyAttempts: 1, turnAckDelayMs: 20 })

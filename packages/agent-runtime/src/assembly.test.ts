@@ -30,7 +30,22 @@ test('same runtime assembles brain and computer with real relay, correlated resu
   brainEngine.turnStart=async request=>{modelStarts++;return startTurn(request)}
   const brain=await startUnifiedRuntime(brainConfig,{seat:{engine:brainEngine,receiptRetryMs:25,log:()=>{}},wechatApi:{poll:async()=>({ret:0,msgs:[]}),send:async(_token,to,text)=>{assert.equal(to,'owner');if(!acknowledge)return {};outputs.push(text);return {messageId:String(outputs.length)}}}})
   runtimes.push(brain)
-  const computer=await startUnifiedRuntime({...base,role:'computer',seat:'computer',stateRoot:path.join(root,'computer'),peerNodes:['assembly:brain']},{seat:{engine:new FakeAppServerClient({scenario:{defaultTurn:{completeAfterMs:5,outcome:{status:'completed',finalText:'computer-evidence'}}}}),log:()=>{}}})
+  const computerEngine=new FakeAppServerClient({scenario:{defaultTurn:{completeAfterMs:250,outcome:{status:'completed',finalText:'computer-evidence'}}}})
+  const originalComputerStart=computerEngine.turnStart.bind(computerEngine)
+  let unresponsive:(request:{threadId:string;msgId:string})=>void=()=>{}
+  const originalEvents=computerEngine.onEvent.bind(computerEngine)
+  computerEngine.onEvent=handler=>{
+    unresponsive=request=>handler({type:'request.unresponsive',...request})
+    return originalEvents(handler)
+  }
+  computerEngine.turnStart=async request=>{
+    assert.equal(request.timeoutMs,0,'unified runtime must disable the destructive engine deadline')
+    assert.ok(request.text.includes(`[mesh-task-id:${request.msgId}]`))
+    const handle=await originalComputerStart(request)
+    setTimeout(()=>unresponsive(request),20)
+    return handle
+  }
+  const computer=await startUnifiedRuntime({...base,role:'computer',seat:'computer',stateRoot:path.join(root,'computer'),peerNodes:['assembly:brain']},{seat:{engine:computerEngine,log:()=>{}}})
   runtimes.push(computer)
   // Fake engines use the same deterministic ID counter; identities/state must still be separate.
   assert.notEqual(brain.seat.state(),computer.seat.state())
@@ -43,7 +58,9 @@ test('same runtime assembles brain and computer with real relay, correlated resu
   acknowledge=true
   await until(()=>outputs.length===1)
   assert.equal(modelStarts,1,'delivery retry must not reexecute model')
-  await new MeshClient(relayUrl).send({from:brain.seat.nodeId,to:computer.seat.nodeId,message:'complete assigned test work',type:'task'})
+  const mesh=new MeshClient(relayUrl)
+  const task=await mesh.send({from:brain.seat.nodeId,to:computer.seat.nodeId,message:'complete assigned test work',type:'task'})
+  await mesh.send({from:computer.seat.nodeId,to:brain.seat.nodeId,message:`[failed] nonce=legacy node=${computer.seat.nodeId} reason=timeout detail=old runtime threshold`,type:'system',replyTo:task.msgId})
   await until(()=>outputs.length===2)
   await brain.seat.drain();await computer.seat.drain()
   assert.equal(modelStarts,2)

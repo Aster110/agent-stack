@@ -205,6 +205,14 @@ class Seat implements SeatHandle {
   private readonly loops = new Map<string, SyncLoopHandle>()
   private readonly loadedThreads = new Set<string>()
   private readonly activeTurns = new Map<string, { threadId: string; handle: TurnHandle; msg: Incoming }>()
+  private readonly observed = new Set<string>()
+  private readonly awaiting = new Set<string>()
+  private readonly observationDelivered = new Set<string>()
+  private readonly observationInFlight = new Set<string>()
+  private readonly snapshotOutcomes = new Map<string, (outcome: TurnOutcome) => void>()
+  private readonly recovering = new Map<string, { msg: Incoming; threadId: string; turnId: string }>()
+  private recoveryTimer: NodeJS.Timeout | null = null
+  private reconciling = false
   private readonly compacting = new Set<string>()
   private readonly eventCounts: Record<string, number> = {}
   private lastRateLimits: RateLimitsSnapshot | null = null
@@ -413,6 +421,19 @@ class Seat implements SeatHandle {
 
   private onEngineEvent(ev: EngineEvent): void {
     this.eventCounts[ev.type] = (this.eventCounts[ev.type] ?? 0) + 1
+    if (ev.type === "request.unresponsive") {
+      const a = this.activeTurns.get(ev.msgId)
+      if (a) void this.observe(a.msg, a.threadId, a.handle.turnId)
+    } else if (ev.type === "turn.started" || ev.type === "item.completed" || ev.type === "token.usage") {
+      for (const a of this.activeTurns.values()) {
+        if (a.threadId === ev.threadId && ev.turnId === a.handle.turnId) this.noteActivity(a.msg, a.threadId, a.handle.turnId)
+      }
+    }
+    if (ev.type === "turn.completed") {
+      for (const a of this.recovering.values()) {
+        if (a.threadId === ev.threadId && a.turnId === ev.turnId) void this.reconcileRecovered(a)
+      }
+    }
     if (ev.type === "token.usage") {
       const ratio = contextUsedRatio(ev.usage, this.config.compact.contextWindowFallback)
       // 每轮记一条占比：E20 要断言 compact 之后占比真的回落，不能只看「没再触发」。
@@ -479,14 +500,19 @@ class Seat implements SeatHandle {
         msgId: f.msgId, seq: f.seq, to: f.to, from: f.from,
         payload: payloads.get(f.msgId) ?? "", nonce: f.nonce, messageType: f.messageType, replyTo: f.replyTo, replyRoute: f.replyRoute,
       }
-      if (!msg.replyRoute && this.consumeMachineReceipt(msg)) continue
+      if (this.consumeMachineReceipt(msg)) continue
       if (f.phase === "fetched") {
         if (this.fault("disable-wal-replay")) { this.log({ event: "wal-replay-skipped", msgId: f.msgId, reason: "fault" }); continue }
         if (msg.payload === "") { this.log({ event: "wal-replay-no-payload", msgId: f.msgId }); continue }
         this.dispatch(msg)
-      } else if (f.phase === "started") {
-        this.log({ event: "wal-replay-interrupted", msgId: f.msgId, threadId: f.threadId })
-        void this.finishFailed(msg, "interrupted-by-restart", `sidecar restarted while turn ${f.turnId ?? "?"} was running`)
+      } else if (f.phase === "started" || f.phase === "observing") {
+        if (f.confirmationRequested) this.observed.add(msg.msgId)
+        if (f.observationSent) this.observationDelivered.add(msg.msgId)
+        if (f.phase === "observing" || !f.confirmationRequested) this.awaiting.add(msg.msgId)
+        const a = { msg, threadId: f.threadId ?? "unknown", turnId: f.turnId ?? "unknown" }
+        this.recovering.set(msg.msgId, a)
+        void this.observe(msg, a.threadId, a.turnId)
+        this.startRecovery()
       } else if (f.phase === "completed") {
         this.log({ event: "wal-replay-redeliver-done", msgId: f.msgId })
         void this.sendDone(msg, f.threadId ?? CTL_THREAD, f.finalText ?? "", 0)
@@ -799,8 +825,14 @@ class Seat implements SeatHandle {
       return true
     }
     if (!isMachineReceiptMessage(msg)) return false
-    if (msg.replyRoute) return false // This route was already validated and persisted.
     const receipt = parseReceipt(msg.payload)
+    // Old timeout receipts are observation evidence even when a prior version
+    // persisted a brain route. They must never become a terminal owner result.
+    if (receipt?.kind === "observation" || (receipt?.kind === "failed" && receipt.reason === "timeout")) {
+      this.appendWal(this.walFor(msg, "receipted", { detail: "nonterminal observation consumed" }))
+      return true
+    }
+    if (msg.replyRoute) return false // This route was already validated and persisted.
     if (this.opts.brainResultRoute && (receipt?.kind === "done" || receipt?.kind === "failed" || receipt?.kind === "rejected") &&
         this.opts.acceptsTaskResult?.({ from: msg.from, to: msg.to, replyTo: msg.replyTo! })) return false
     this.appendWal(this.walFor(msg, "receipted", { detail: "machine receipt consumed" }))
@@ -970,7 +1002,13 @@ class Seat implements SeatHandle {
       return
     }
 
-    return await this.withThreadLock(threadId, () => this.runTurnLocked(msg, threadId))
+    return await this.withThreadLock(threadId, async () => {
+      while ([...this.recovering.values()].some((a) => a.threadId === threadId)) {
+        if (this.stopped) return
+        await sleep(100)
+      }
+      await this.runTurnLocked(msg, threadId)
+    })
   }
 
   private async runTurnLocked(msg: Incoming, threadId: string): Promise<void> {
@@ -984,10 +1022,10 @@ class Seat implements SeatHandle {
       handle = await this.engine.turnStart({
         threadId,
         // 与 inject 形态的 formatDelivery 同款前缀：让模型知道谁在说话。
-        text: `[mesh:${msg.from}] ${msg.payload}`,
+        text: `[mesh:${msg.from}] ${msg.payload}\n[mesh-task-id:${msg.msgId}]`,
         nonce: msg.nonce,
         msgId: msg.msgId,
-        timeoutMs: this.config.turn.timeoutMs,
+        timeoutMs: 0,
       })
     } catch (err) {
       await this.finishFailed(msg, "turn-start-failed", String(err))
@@ -1000,6 +1038,7 @@ class Seat implements SeatHandle {
     // [seen]：先写 WAL started，再发。顺序反了就等于「宣称看见了但崩了之后没人知道」。
     const seenChain = handle.started.then(
       async ({ turnId }) => {
+        if (["completed", "failed", "rejected", "done"].includes(this.wal.fold().get(msg.msgId)?.phase ?? "")) return
         startedAtMs = Date.now()
         this.appendWal(this.walFor(msg, "started", { threadId, turnId }))
         this.st.lastSeenAt = iso()
@@ -1014,18 +1053,13 @@ class Seat implements SeatHandle {
       () => { /* started 没来（被 interrupt / 引擎吞了）：没有 seen */ },
     ).catch((err) => this.log({ event: "seen-failed", msgId: msg.msgId, error: String(err) }))
 
-    let timer: NodeJS.Timeout | null = null
-    const outcome: TurnOutcome = await Promise.race([
-      handle.done,
-      new Promise<TurnOutcome>((resolve) => {
-        // 引擎自己也认 timeoutMs（A 的 client 会按 req.timeoutMs 结算），这里只是**兜底**：
-        // 引擎万一不结算，席位也不能挂死。多给 1s 让引擎先说话，避免两边同时开火。
-        timer = setTimeout(() => {
-          void handle.interrupt().catch(() => {})
-          resolve({ status: "timeout", turnId: handle.turnId, wallMs: Date.now() - t0 })
-        }, this.config.turn.timeoutMs + 1000)
-      }),
-    ])
+    const snapshotOutcome = new Promise<TurnOutcome>((resolve) => this.snapshotOutcomes.set(msg.msgId, resolve))
+    const timer = this.config.turn.timeoutMs > 0 ? setTimeout(() => {
+      void this.observe(msg, threadId, handle.turnId)
+    }, this.config.turn.timeoutMs) : null
+    const outcome = await Promise.race([handle.done, snapshotOutcome])
+    this.snapshotOutcomes.delete(msg.msgId)
+    this.recovering.delete(msg.msgId)
     if (timer) clearTimeout(timer)
     this.activeTurns.delete(msg.msgId)
     // 终态回执绝不能越过 [seen]（探针按到达顺序断言 seen 早于 done）。
@@ -1058,14 +1092,99 @@ class Seat implements SeatHandle {
       case "failed": await this.finishFailed(msg, "turn-failed", outcome.message); return
       case "interrupted": await this.finishFailed(msg, this.stopped ? "shutdown" : "interrupted", "turn interrupted"); return
       case "timeout":
-        // 无论超时是引擎报的还是兜底定时器报的，都补一刀 interrupt——
-        // 不确认引擎那边真的停了就发终态，等于留一个还在烧 token 的孤儿 turn。
-        await handle.interrupt().catch(() => {})
-        await this.finishFailed(msg, "timeout", `turn exceeded ${this.config.turn.timeoutMs}ms`)
+      case "lost":
+        this.recovering.set(msg.msgId, { msg, threadId, turnId: handle.turnId ?? "unknown" })
+        await this.observe(msg, threadId, handle.turnId)
+        this.startRecovery()
         return
-      case "lost": await this.finishFailed(msg, "interrupted", `engine lost: ${outcome.reason}`); return
       case "rejected": await this.finishFailed(msg, "turn-start-failed", `${outcome.code}: ${outcome.message}`); return
     }
+  }
+
+  /** Persist the observation before attempting transport or read-only recovery. */
+  private async observe(msg: Incoming, threadId: string, turnId: string | null): Promise<void> {
+    const first = !this.observed.has(msg.msgId)
+    if (first) {
+      this.observed.add(msg.msgId)
+      this.awaiting.add(msg.msgId)
+      this.appendWal(this.walFor(msg, "observing", { threadId, ...(turnId ? { turnId } : {}) }))
+    }
+    // Establish recovery before I/O; late completion must not recreate it.
+    if (first && this.activeTurns.has(msg.msgId)) this.recovering.set(msg.msgId, { msg, threadId, turnId: turnId ?? "unknown" })
+    this.log({ event: "turn-awaiting-confirmation", msgId: msg.msgId, threadId, turnId })
+    this.startRecovery()
+    await this.deliverObservation(msg, threadId, turnId)
+  }
+
+  private noteActivity(msg: Incoming, threadId: string, turnId: string | null): void {
+    if (!this.awaiting.delete(msg.msgId)) return
+    this.observationDelivered.delete(msg.msgId)
+    this.appendWal(this.walFor(msg, "active", { threadId, ...(turnId ? { turnId } : {}) }))
+    void this.deliverObservation(msg, threadId, turnId)
+  }
+
+  private async deliverObservation(msg: Incoming, threadId: string, turnId: string | null): Promise<void> {
+    if (this.observationDelivered.has(msg.msgId) || this.observationInFlight.has(msg.msgId)) return
+    const state = this.awaiting.has(msg.msgId) ? "awaiting_confirmation" : "running"
+    this.observationInFlight.add(msg.msgId)
+    try {
+      if (await this.sendReceipt(msg, { kind: "observation", nonce: msg.nonce, node: msg.to, thread: threadId, turn: turnId ?? "unknown", state })) {
+        if ((this.awaiting.has(msg.msgId) ? "awaiting_confirmation" : "running") === state) {
+          this.observationDelivered.add(msg.msgId)
+          this.appendWal(this.walFor(msg, "observation-sent"))
+        }
+      }
+    } finally {
+      this.observationInFlight.delete(msg.msgId)
+      // Activity can race the awaiting receipt. Flush that state transition
+      // immediately rather than lose it behind the in-flight delivery guard.
+      const current = this.awaiting.has(msg.msgId) ? "awaiting_confirmation" : "running"
+      if (current !== state && this.recovering.has(msg.msgId)) void this.deliverObservation(msg, threadId, turnId)
+    }
+  }
+
+  private startRecovery(): void {
+    if (this.recoveryTimer) return
+    const reconcile = async (): Promise<void> => {
+      if (this.reconciling || this.stopped || !this.engineUp) return
+      this.reconciling = true
+      try {
+        for (const a of [...this.recovering.values()]) {
+          await this.deliverObservation(a.msg, a.threadId, a.turnId)
+          await this.reconcileRecovered(a)
+        }
+      } finally { this.reconciling = false }
+    }
+    this.recoveryTimer = setInterval(() => { void reconcile() }, this.opts.receiptRetryMs ?? 5000)
+    this.recoveryTimer.unref()
+    void reconcile()
+  }
+
+  private async reconcileRecovered(a: { msg: Incoming; threadId: string; turnId: string }): Promise<void> {
+    if (!this.engine.readTurn || !this.recovering.has(a.msg.msgId)) return
+    try {
+      const outcome = await this.engine.readTurn(a.threadId, a.turnId, a.msg.msgId)
+      if (!this.recovering.has(a.msg.msgId)) return
+      if ("turnId" in outcome && outcome.turnId && a.turnId === "unknown") {
+        a.turnId = outcome.turnId
+        if (outcome.status === "running") this.appendWal(this.walFor(a.msg, "started", { threadId: a.threadId, turnId: a.turnId }))
+      }
+      if (outcome.status === "running") { this.noteActivity(a.msg, a.threadId, a.turnId); return }
+      const resolve = this.snapshotOutcomes.get(a.msg.msgId)
+      if (resolve && (outcome.status === "completed" || outcome.status === "failed")) { resolve(outcome); return }
+      if (outcome.status === "completed") {
+        this.recovering.delete(a.msg.msgId)
+        if (!outcome.finalText?.trim()) { await this.finishFailed(a.msg, "no-output", "turn completed without agent message"); return }
+        this.appendWal(this.walFor(a.msg, "completed", { threadId: a.threadId, turnId: a.turnId, finalText: outcome.finalText }))
+        this.st.lastDoneAt = iso()
+        this.markResumable(a.threadId)
+        this.saveState()
+        void this.sendDone(a.msg, a.threadId, outcome.finalText, outcome.wallMs)
+      } else if (outcome.status === "failed") {
+        this.recovering.delete(a.msg.msgId)
+        await this.finishFailed(a.msg, "turn-failed", outcome.message)
+      }
+    } catch (err) { this.log({ event: "recovery-read-unavailable", msgId: a.msg.msgId, error: String(err) }) }
   }
 
   private maybeCompact(threadId: string, ratio: number): void {
@@ -1100,13 +1219,14 @@ class Seat implements SeatHandle {
             text: r.kind === "done" ? r.body : formatReceipt(r) })
         }
       } else {
-      await this.mesh.send({
+      const sent = await this.mesh.send({
         from,
         to: msg.from,
         message: formatReceipt(r),
         type: receiptMessageType(r.kind),
         replyTo: msg.msgId,
       })
+      if (sent.status !== "accepted" && sent.status !== "delivered") throw new Error(`receipt pending: relay returned ${sent.status}`)
       }
       this.log({ event: "receipt", kind: r.kind, nonce: msg.nonce, to: msg.from, from })
       return true
@@ -1373,7 +1493,7 @@ class Seat implements SeatHandle {
     let fetched = 0, started = 0, completed = 0, failed = 0, rejected = 0
     for (const f of folded.values()) {
       if (f.phase === "fetched") fetched++
-      else if (f.phase === "started") started++
+      else if (f.phase === "started" || f.phase === "observing") started++
       else if (f.phase === "completed") completed++
       else if (f.phase === "failed") failed++
       else if (f.phase === "rejected") rejected++
@@ -1441,6 +1561,7 @@ class Seat implements SeatHandle {
     if (this.engineRetryTimer) clearTimeout(this.engineRetryTimer)
     if (this.ledgerTimer) clearInterval(this.ledgerTimer)
     if (this.receiptTimer) clearInterval(this.receiptTimer)
+    if (this.recoveryTimer) clearInterval(this.recoveryTimer)
     for (const [sig, h] of this.signalHandlers) process.off(sig, h)
     this.signalHandlers = []
 

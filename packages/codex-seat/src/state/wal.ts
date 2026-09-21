@@ -68,7 +68,7 @@ export class WalStore {
         if (this.strict && index !== lines.length - 1) throw new Error(`corrupt WAL record at line ${index + 1}`)
         continue // Only a truncated final JSON fragment can be discarded.
       }
-      if (this.strict && (!obj || !["fetched", "routed", "submitting", "started", "completed", "failed", "rejected", "receipted"].includes(obj.op) ||
+      if (this.strict && (!obj || !["fetched", "routed", "submitting", "started", "observing", "active", "observation-sent", "completed", "failed", "rejected", "receipted"].includes(obj.op) ||
           ![obj.msgId, obj.to, obj.from, obj.nonce, obj.at].every(v => typeof v === "string") || !Number.isFinite(obj.seq)))
         throw new Error(`corrupt WAL schema at line ${index + 1}`)
       if (obj && typeof obj.op === "string" && typeof obj.msgId === "string") out.push(obj)

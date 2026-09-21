@@ -118,7 +118,9 @@ function str(env: Record<string, unknown>, ...keys: string[]): string | null {
 }
 
 export class Projector {
-  constructor(private readonly store: LedgerStore) {}
+  constructor(private readonly store: LedgerStore) {
+    for (const id of store.legacyTimeoutTaskIds()) this.projectReplies(id)
+  }
 
   /**
    * 消费一批上行账本事件。整批一个事务：中途抛错则全批回滚，Hub 不回 ack，
@@ -161,6 +163,7 @@ export class Projector {
     switch (msg.type) {
       case "task": this.projectTask(msg); break
       case "result": this.projectResult(msg); break
+      case "system": this.projectResult(msg); break
       default:
         // 自由字符串 type（quota_report 等）走哨兵语义；其余只进 ledger_messages。
         if (String(msg.type) === "quota_report" && msg.to === LEDGER_SINK) this.projectQuota(msg)
@@ -190,18 +193,44 @@ export class Projector {
     // 乱序补偿：跨 relay 上行没有全局顺序，result 可能比 task 先到云端。
     // task 落地时回查已在账的 result，有就直接关单——否则这单会永远停在 dispatched，
     // 60s 后还会被孤儿扫描误标 orphaned。
-    const existing = this.store.findResultsReplyingTo(msg.id)
-    if (existing.length > 0) {
-      const first = existing[0]
-      this.store.markTaskReplied(msg.id, first.id, first.createdAt)
-    }
+    this.projectReplies(msg.id)
   }
 
   /** type=result 且 replyTo 命中 task → replied。没命中就什么也不做，等 task 到了补偿。 */
   private projectResult(msg: MeshMessage): void {
     if (!msg.replyTo) return
     if (!this.store.getTask(msg.replyTo)) return
-    this.store.markTaskReplied(msg.replyTo, msg.id, msg.createdAt)
+    this.projectReplies(msg.replyTo)
+  }
+
+  private projectReplies(taskId: string): void {
+    const task = this.store.getTask(taskId)
+    if (!task) return
+    let state: "running" | "awaiting_confirmation" | "failed" | "replied" | null = null
+    let terminal: { id: string; createdAt: string | null } | null = null
+    const previousReceipt = task.replyMsgId ? this.store.getMessage(task.replyMsgId) : null
+    const previousWasTimeout = /^\[failed\].*\breason=timeout(?:\s|$)/.test((previousReceipt?.payload ?? "").split("\n")[0]!)
+    // Receipt retention cannot erase an already established terminal task state.
+    if ((task.status === "replied" || task.status === "failed") && task.replyMsgId && !previousWasTimeout) {
+      state = task.status
+      terminal = { id: task.replyMsgId, createdAt: task.repliedAt ?? task.createdAt }
+    }
+    for (const msg of this.store.findTaskReplies(taskId)) {
+      if (msg.type !== "result" && (msg.from !== task.toNode || msg.to !== task.fromNode)) continue
+      const head = (msg.payload ?? "").split("\n")[0]!
+      if (/^\[failed\].*\breason=timeout(?:\s|$)/.test(head)) {
+        if (!terminal) state = "awaiting_confirmation"
+      } else if (/^\[failed\].*\breason=/.test(head)) {
+        if (state !== "replied") { state = "failed"; terminal = msg }
+      } else if (msg.type === "result") {
+        state = "replied"; terminal = msg
+      } else if (!terminal && /^\[observation\].*\bstate=awaiting_confirmation$/.test(head)) {
+        state = "awaiting_confirmation"
+      } else if (!terminal && (/^\[seen\]/.test(head) || /^\[observation\].*\bstate=running$/.test(head))) {
+        state = "running"
+      }
+    }
+    if (state) this.store.projectTaskState(taskId, state, terminal?.id ?? null, terminal?.createdAt ?? null)
   }
 
   /** type=quota_report 且 to=@ledger → quota_snapshots + accounts。解析失败只记事件，不崩。 */
