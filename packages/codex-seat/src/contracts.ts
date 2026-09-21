@@ -960,7 +960,7 @@ export interface IAppServerClient {
   /** 同一 thread 上调用方必须串行（turn/start 打在 active thread 上会被当成 steer）。 */
   turnStart(req: TurnStartRequest): Promise<TurnHandle>
   /** Read-only recovery of the original execution, including uncertain submission ACKs. */
-  readTurn?(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown" }>
+  readTurn?(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown"; reason?: "not-found" | "read-error" }>
   turnInterrupt(threadId: string, turnId: string): Promise<void>
   compact(threadId: string, timeoutMs: number): Promise<CompactOutcome>
   loadedThreads(): Promise<string[]>

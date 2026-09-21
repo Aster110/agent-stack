@@ -519,14 +519,14 @@ export class RealAppServerClient implements IAppServerClient {
     await conn.request("turn/interrupt", { threadId, turnId }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS)
   }
 
-  async readTurn(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown" }> {
+  async readTurn(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown"; reason?: "not-found" | "read-error" }> {
     const r = await this.requireConn().request("thread/read", { threadId, includeTurns: true }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS)
-    if (r.error) return { status: "unknown" }
+    if (r.error) return { status: "unknown", reason: "read-error" }
     const matches = (r.result?.thread?.turns ?? []).filter((t: { id: string; items?: Array<{ type: string }> }) => turnId !== "unknown"
       ? t.id === turnId
       : !!msgId && (t.items ?? []).some((i) => i.type === "userMessage" && JSON.stringify(i).includes(`[mesh-task-id:${msgId}]`)))
     const turn = matches.length === 1 ? matches[0] : null
-    if (!turn) return { status: "unknown" }
+    if (!turn) return { status: "unknown", reason: "not-found" }
     turnId = turn.id
     if (turn.status === "inProgress") return { status: "running", turnId }
     const settleSnapshot = (outcome: TurnOutcome): TurnOutcome => {
