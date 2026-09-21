@@ -18,6 +18,7 @@ import type {
   ThreadStartRequest,
   TurnHandle,
   TurnStartRequest,
+  TurnOutcome,
 } from "../../contracts.js"
 
 export class SpyEngine implements IAppServerClient {
@@ -127,5 +128,9 @@ export class SpyEngine implements IAppServerClient {
   async compact(threadId: string, timeoutMs: number): Promise<CompactOutcome> {
     this.compactCalls.push(threadId)
     return await this.inner.compact(threadId, timeoutMs)
+  }
+
+  async readTurn(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown" }> {
+    return this.inner.readTurn ? this.inner.readTurn(threadId, turnId, msgId) : { status: "unknown" }
   }
 }

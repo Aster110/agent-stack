@@ -19,7 +19,7 @@ async function until(fn: () => boolean, why: string) {
   const end = Date.now() + 5000
   while (!fn()) { if (Date.now() > end) throw new Error(why); await sleep(5) }
 }
-async function harness(t: any, options: SeatRuntimeOptions = {}) {
+async function harness(t: any, options: SeatRuntimeOptions = {}, observationMs = 2000) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'unified-seat-'))
   const relay = await FakeRelay.start('lab')
   const engine = new SpyEngine(new FakeAppServerClient({ scenario: { defaultTurn: { completeAfterMs: 20, outcome: {status:'completed', finalText:'verified-result'} } } }))
@@ -31,7 +31,7 @@ async function harness(t: any, options: SeatRuntimeOptions = {}) {
   } } }
   const config = resolveSeatConfig({ seat:'unified', cwd:home, relayUrl:relay.url,
     hub:{enabled:false,ledgerUrl:'http://127.0.0.1:1',tokenFile:path.join(home,'token'),intervalSec:300},
-    allowlist:{extra:['lab:probe'],disableDefaults:true},sync:{timeoutSec:1,limit:100},turn:{timeoutMs:2000} })
+    allowlist:{extra:['lab:probe'],disableDefaults:true},sync:{timeoutSec:1,limit:100},turn:{timeoutMs:observationMs} })
   const opts = { engine, channels, ledger:null, homeDir:home, installSignalHandlers:false,
     receiptRetryMs:25, log: () => {}, ...options }
   let seat = await runSeat(config,opts)
@@ -98,6 +98,18 @@ test('completed channel outbox is delivered after process restart with original 
   assert.equal(h.outputs.find(x=>x.output.kind==='done')?.endpoint,'owner')
 })
 
+test('HTTP 200 with non-accepted mesh status retains result outbox until confirmed delivery', async t => {
+  const h=await harness(t)
+  h.relay.failWith={pathPrefix:'/api/send',status:200,body:JSON.stringify({ok:true,data:{msgId:'unconfirmed',status:'failed'}})}
+  h.relay.deliver(h.seat.nodeId,'lab:probe','unconfirmed result')
+  await until(()=>[...h.wal().values()].some(f=>f.phase==='completed'),'pending result after unconfirmed response')
+  await sleep(70)
+  assert.ok([...h.wal().values()].some(f=>f.phase==='completed'))
+  h.relay.failWith=null
+  await until(()=>h.relay.sends.some(s=>s.type==='result'),'confirmed retry')
+  assert.equal(h.engine.turnCalls.length,1)
+})
+
 test('only correlated terminal results wake brain; replies go to owner without receipt loop', async t => {
   const h=await harness(t,{brainResultRoute:{channel:'wechat',endpointId:'owner'},acceptsTaskResult:m=>m.replyTo==='assigned-task'})
   const result=formatReceipt({kind:'done',node:'lab:probe',nonce:'result1',thread:'worker-thread',ms:1,body:'file created'})
@@ -115,6 +127,62 @@ test('worker role still consumes machine results without model turn or reply', a
   await until(()=>h.seat.state().recentMsgIds.includes(id),'receipt consumed')
   await h.seat.drain()
   assert.equal(h.engine.turnCalls.length,0);assert.equal(h.relay.sends.length,0)
+})
+
+test('brain consumes observation and legacy timeout receipts while a late result still reaches owner', async t => {
+  const h=await harness(t,{strictResultEnvelopes:true,brainResultRoute:{channel:'wechat',endpointId:'owner'},acceptsTaskResult:m=>m.replyTo==='assigned-task'})
+  const messages=[
+    formatReceipt({kind:'failed',reason:'timeout',node:'lab:probe',nonce:'oldtimeout',detail:'legacy timeout'}),
+    formatReceipt({kind:'observation',node:'lab:probe',nonce:'watching',thread:'original',turn:'turn',state:'awaiting_confirmation'}),
+    formatReceipt({kind:'observation',node:'lab:probe',nonce:'watching',thread:'original',turn:'turn',state:'running'}),
+  ]
+  const ids=messages.map(payload=>h.relay.deliver(h.seat.nodeId,'lab:probe',payload,'system','assigned-task'))
+  await until(()=>ids.every(id=>h.seat.state().recentMsgIds.includes(id)),'observations consumed')
+  await h.seat.drain()
+  assert.equal(h.engine.turnCalls.length,0);assert.equal(h.outputs.length,0)
+  h.relay.deliver(h.seat.nodeId,'lab:probe',formatReceipt({kind:'done',node:'lab:probe',nonce:'late',thread:'original',ms:3000,body:'late original result'}),'result','assigned-task')
+  await until(()=>h.outputs.some(x=>x.output.kind==='done'),'late owner result')
+  assert.equal(h.engine.turnCalls.length,1);assert.equal(h.relay.sends.length,0)
+})
+
+test('channel observation preserves ReplyRoute and original late result retries through existing outbox', async t => {
+  const engine=new SpyEngine(new FakeAppServerClient({scenario:{defaultTurn:{completeAfterMs:150,outcome:{status:'completed',finalText:'late channel result'}}}}))
+  const h=await harness(t,{engine,strictPersistence:true},30)
+  h.setDown(true);h.input('long-channel')
+  await until(()=>[...h.wal().values()].some(f=>f.phase==='observing'),'channel observation')
+  assert.equal(engine.turnCalls[0]!.timeoutMs,0)
+  assert.equal(engine.interrupts.length,0)
+  await until(()=>[...h.wal().values()].some(f=>f.phase==='completed'),'channel completed outbox')
+  assert.equal(h.outputs.some(x=>x.output.kind==='failed'),false)
+  h.setDown(false)
+  await until(()=>h.outputs.some(x=>x.output.kind==='done'),'channel late done')
+  assert.equal(h.outputs.find(x=>x.output.kind==='done')!.output.text,'late channel result')
+  assert.equal(h.outputs.find(x=>x.output.kind==='done')!.endpoint,'owner')
+  assert.equal(engine.turnCalls.length,1);assert.equal(h.relay.sends.length,0)
+})
+
+test('legacy timeout receipted WAL survives compaction and returns recovered output to channel', async t => {
+  const h=await harness(t)
+  await h.seat.stop()
+  const base:WalEntry={op:'fetched',msgId:'channel:legacy',seq:1,to:h.seat.nodeId,from:'wechat:owner',nonce:'legacy',at:new Date().toISOString(),payload:'original',replyRoute:{channel:'wechat',endpointId:'owner'}}
+  const wal=new WalStore(seatPaths('unified',h.home).wal)
+  for(const entry of [base,{...base,op:'submitting',threadId:'old-thread'},{...base,op:'failed',reason:'timeout',awaitingReceipt:true},{...base,op:'receipted'}] as WalEntry[])wal.append(entry)
+  assert.equal(wal.compact(),1);wal.close()
+  const engine=new SpyEngine(new FakeAppServerClient())
+  let confirmed=false,reads=0
+  engine.readTurn=async(threadId,turnId,msgId)=>{
+    reads++;assert.equal(threadId,'old-thread');assert.equal(msgId,base.msgId)
+    assert.equal(turnId,reads===1?'unknown':'old-turn')
+    return confirmed?{status:'completed',turnId:'old-turn',finalText:'recovered channel result',wallMs:0,startedMs:0}:{status:'interrupted',turnId:'old-turn',wallMs:0}
+  }
+  await h.restart({engine})
+  await until(()=>reads>0,'read original interrupted snapshot')
+  assert.equal(h.wal().get(base.msgId)?.phase,'observing')
+  assert.equal(h.outputs.some(x=>x.output.kind==='failed'),false)
+  confirmed=true
+  await until(()=>h.outputs.some(x=>x.output.kind==='done'),'recovered channel done')
+  assert.equal(h.outputs.find(x=>x.output.kind==='done')!.endpoint,'owner')
+  assert.equal(engine.turnCalls.length,0);assert.equal(h.relay.sends.length,0)
 })
 
 test('unapproved channel endpoint is rejected before model execution or WAL acceptance', async t => {
@@ -141,7 +209,12 @@ test('execution intent is durable before RPC and cannot fold back into unstarted
 test('legacy failure entries remain terminal while new pending failures retain their outbox', () => {
   const base:WalEntry={op:'fetched',msgId:'failure',seq:1,to:'lab:unified',from:'lab:probe',nonce:'failure',at:new Date().toISOString()}
   assert.equal(foldWal([base,{...base,op:'failed'}]).get(base.msgId)?.phase,'done')
-  assert.equal(foldWal([base,{...base,op:'failed',awaitingReceipt:true,reason:'timeout',detail:'timed out'}]).get(base.msgId)?.phase,'failed')
+  assert.equal(foldWal([base,{...base,op:'failed',awaitingReceipt:true,reason:'turn-failed',detail:'explicit failure'}]).get(base.msgId)?.phase,'failed')
+  assert.equal(foldWal([base,{...base,op:'failed',reason:'timeout'},{...base,op:'receipted'}]).get(base.msgId)?.phase,'observing')
+  const finished=[base,{...base,op:'completed',finalText:'final'},{...base,op:'receipted'}] as WalEntry[]
+  assert.equal(foldWal([...finished,{...base,op:'started',threadId:'late',turnId:'late'}]).get(base.msgId)?.phase,'done')
+  assert.equal(foldWal([...finished,{...base,op:'observing'}]).get(base.msgId)?.phase,'done')
+  assert.equal(foldWal([base,{...base,op:'completed',finalText:'final'},{...base,op:'failed',reason:'timeout'},{...base,op:'receipted'}]).get(base.msgId)?.phase,'done')
 })
 
 test('durable channel tombstone survives recent-ID eviction, WAL compaction and restart', {timeout:60000}, async t=>{
@@ -232,7 +305,9 @@ test('SIGKILL after durable submission intent does not reexecute a side effect',
   const engine=new SpyEngine(new FakeAppServerClient({}));const outputs:ChannelOutput[]=[]
   const seat=await runSeat(config,{engine,homeDir:home,strictPersistence:true,preserveThreadOnResumeFailure:true,installSignalHandlers:false,log:()=>{},channels:{wechat:{accepts:()=>true,send:async(_id,o)=>{outputs.push(o)}}}})
   t.after(()=>seat.stop())
-  await until(()=>outputs.some(o=>o.kind==='failed'),'interruption notice')
+  const wal=new WalStore(seatPaths('crash',home).wal)
+  await until(()=>[...wal.fold().values()].some(f=>f.phase==='observing'),'uncertain original submission retained')
+  assert.equal(outputs.some(o=>o.kind==='failed'),false)
   assert.equal(fs.readFileSync(path.join(home,'effect'),'utf8'),'once\n')
   assert.equal(engine.turnCalls.length,0)
   assert.equal(seat.deliver({channel:'wechat',endpointId:'owner',id:'kill-input',text:'side effect'}),'duplicate')

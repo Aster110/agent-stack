@@ -49,7 +49,7 @@ export function walCounts(entries: readonly WalEntry[]): WalCounts {
   const out: WalCounts = { fetched: 0, started: 0, completed: 0 }
   for (const f of foldWal(entries).values()) {
     if (f.phase === "fetched") out.fetched++
-    else if (f.phase === "started") out.started++
+    else if (f.phase === "started" || f.phase === "observing") out.started++
     else if (f.phase === "completed") out.completed++
     else if (f.phase === "failed") out.failed = (out.failed ?? 0) + 1
     else if (f.phase === "rejected") out.rejected = (out.rejected ?? 0) + 1

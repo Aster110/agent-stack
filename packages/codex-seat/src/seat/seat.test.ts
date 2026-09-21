@@ -125,6 +125,104 @@ async function start(opts: {
 
 // ---------------------------------------------------------------------------
 
+test("legacy timeout WAL survives two restarts, deduplicates confirmation, and recovers late result", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-seat-recovery-"))
+  const paths = seatPaths(SEAT, home)
+  const at = new Date().toISOString()
+  const common = { msgId: "legacy-timeout", seq: 9, to: `e2edev:${SEAT}`, from: PROBE, nonce: "oldtimeout", at }
+  seedWal(paths, [
+    { ...common, op: "fetched", payload: "must never resubmit" },
+    { ...common, op: "started", threadId: "original-thread", turnId: "original-turn" },
+    { ...common, op: "failed", reason: "timeout", detail: "turn exceeded 1800000ms" },
+  ])
+  seedState(paths, { cursor: 9 })
+  const h1 = await start({ home })
+  await waitFor(() => receipts(h1.relay).some((r) => r.kind === "observation"))
+  assert.equal(h1.engine.turnCalls.length, 0)
+  await h1.stop()
+  const engine = new SpyEngine(new FakeAppServerClient({ scenario: {} }))
+  const reads: string[][] = []
+  engine.readTurn = async (threadId, turnId) => {
+    reads.push([threadId, turnId])
+    return { status: "completed", turnId, finalText: "RECOVERED-LATE", wallMs: 0, startedMs: 0 }
+  }
+  const h2 = await start({ home, engine })
+  try {
+    const done = await waitFor(() => receiptRecords(h2.relay).find((r) => r.r.kind === "done"))
+    assert.equal(done.rec.replyTo, "legacy-timeout")
+    assert.match(done.rec.message, /RECOVERED-LATE/)
+    assert.deepEqual(reads, [["original-thread", "original-turn"]])
+    assert.equal(receipts(h2.relay).filter((r) => r.kind === "observation").length, 0)
+    assert.equal(engine.turnCalls.length, 0)
+    assert.equal(h2.wal().filter((r) => r.op === "observing").length, 1)
+  } finally { await h2.stop() }
+})
+
+test("activity after observation restores running and confirmation remains once", async () => {
+  const h = await start({ configPatch: { turn: { timeoutMs: 50 } }, scenario: { defaultTurn: { completeAfterMs: 300 } } })
+  try {
+    h.relay.deliver(h.nodeId, PROBE, "activity nonce=activity1")
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "observation" && r.state === "awaiting_confirmation"))
+    const started = h.wal().find((e) => e.op === "started")!
+    h.engine.emit({ type: "item.completed", threadId: started.threadId!, turnId: started.turnId!, itemType: "commandExecution", server: null, tool: null, status: "completed" })
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "observation" && r.state === "running"))
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "done"))
+    assert.equal(h.wal().filter((e) => e.op === "observing").length, 1)
+    assert.equal(h.engine.interrupts.length, 0)
+  } finally { await h.stop() }
+})
+
+test("confirmation terminal snapshot resolves original task before missing notification; late notification cannot duplicate done", async () => {
+  const engine = new SpyEngine(new FakeAppServerClient({ scenario: { defaultTurn: { completeAfterMs: 300 } } }))
+  engine.readTurn = async (_threadId, turnId) => ({ status: "completed", turnId, finalText: "snapshot-result", wallMs: 70, startedMs: 5 })
+  const h = await start({ engine, configPatch: { turn: { timeoutMs: 50 } } })
+  try {
+    const task = h.relay.deliver(h.nodeId, PROBE, "snapshot nonce=snapshot")
+    const done = await waitFor(() => receiptRecords(h.relay).find((r) => r.r.kind === "done"), 250)
+    assert.equal(done.rec.replyTo, task)
+    assert.match(done.rec.message, /snapshot-result/)
+    await sleep(350)
+    assert.equal(receipts(h.relay).filter((r) => r.kind === "done").length, 1)
+    assert.equal(engine.interrupts.length, 0)
+  } finally { await h.stop() }
+})
+
+test("WAL observation written before crash retries missing receipt without resubmitting business input", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-seat-observation-outbox-"))
+  const paths = seatPaths(SEAT, home)
+  const common = { msgId: "outbox-task", seq: 9, to: `e2edev:${SEAT}`, from: PROBE, nonce: "outbox", at: new Date().toISOString() }
+  seedWal(paths, [{ ...common, op: "fetched", payload: "original" }, { ...common, op: "submitting", threadId: "t-original" }, { ...common, op: "observing", threadId: "t-original" }])
+  seedState(paths, { cursor: 9 })
+  const h = await start({ home })
+  try {
+    await waitFor(() => receiptRecords(h.relay).find((r) => r.r.kind === "observation"))
+    assert.equal(h.engine.turnCalls.length, 0)
+    assert.equal(h.wal().filter((e) => e.op === "observing").length, 1)
+    assert.equal(h.wal().filter((e) => e.op === "observation-sent").length, 1)
+    assert.equal((await h.seat.status()).wal.started, 1)
+  } finally { await h.stop() }
+})
+
+test("failed late-result delivery remains completed in WAL and is sent after restart", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-seat-result-outbox-"))
+  const relay = await FakeRelay.start()
+  const h = await start({ home, relay, configPatch: { turn: { timeoutMs: 50 } }, scenario: { defaultTurn: { completeAfterMs: 180, outcome: { status: "completed", finalText: "durable-late" } } } })
+  const task = relay.deliver(h.nodeId, PROBE, "late nonce=lateoutbox")
+  await waitFor(() => receipts(relay).some((r) => r.kind === "observation"))
+  relay.failWith = { pathPrefix: "/api/send", status: 503 }
+  await waitFor(() => h.wal().some((e) => e.op === "completed" && e.msgId === task))
+  await sleep(30)
+  assert.equal(h.wal().some((e) => e.op === "receipted" && e.msgId === task), false)
+  await h.stop()
+  const h2 = await start({ home })
+  try {
+    const done = await waitFor(() => receiptRecords(h2.relay).find((r) => r.r.kind === "done"))
+    assert.equal(done.rec.replyTo, task)
+    assert.match(done.rec.message, /durable-late/)
+    assert.equal(h2.engine.turnCalls.length, 0)
+  } finally { await h2.stop() }
+})
+
 test("seat: 以 pull 形态注册主席位，主 thread 带 developerInstructions 与 MESH_NODE 覆盖", async () => {
   // 注入：thread/start 不传 config（等价 fault disable-thread-env-override）→ 署名断言红
   const h = await start()
@@ -211,7 +309,7 @@ test("seat: 投给模型的正文带 [mesh:<from>] 前缀", async () => {
   try {
     h.relay.deliver(h.nodeId, PROBE, "hello nonce=pfx1")
     await waitFor(() => receipts(h.relay).find((r) => r.kind === "done"), 5000, "[done]")
-    assert.equal(h.engine.turnCalls[0]!.text, `[mesh:${PROBE}] hello nonce=pfx1`)
+    assert.equal(h.engine.turnCalls[0]!.text, `[mesh:${PROBE}] hello nonce=pfx1\n[mesh-task-id:${h.engine.turnCalls[0]!.msgId}]`)
   } finally { await h.stop() }
 })
 
@@ -427,14 +525,14 @@ test("seat: 超过 maxWorkers → [failed] max-workers", async () => {
   } finally { await h.stop() }
 })
 
-test("seat: 引擎失败三态——turn-failed / no-output / timeout（超时要真 interrupt）", async () => {
+test("seat: explicit failure stays terminal; observation never interrupts and late result keeps task correlation", async () => {
   const h = await start({
     configPatch: { turn: { timeoutMs: 300 } },
     scenario: {
       turns: [
         { match: { textIncludes: "fail-me" }, outcome: { status: "failed", message: "模型炸了" } },
         { match: { textIncludes: "silent-me" }, outcome: { status: "completed", finalText: null } },
-        { match: { textIncludes: "hang-me" }, startedAfterMs: 5, completeAfterMs: 60_000, outcome: { status: "completed", finalText: "late" } },
+        { match: { textIncludes: "hang-me" }, startedAfterMs: 5, completeAfterMs: 800, outcome: { status: "completed", finalText: "late" } },
       ],
     },
   })
@@ -448,8 +546,13 @@ test("seat: 引擎失败三态——turn-failed / no-output / timeout（超时�
     assert.equal((await byNonce("f001")).reason, "turn-failed" satisfies FailReason)
     assert.match((await byNonce("f001")).detail, /模型炸了/)
     assert.equal((await byNonce("f002")).reason, "no-output" satisfies FailReason)
-    assert.equal((await byNonce("f003")).reason, "timeout" satisfies FailReason)
-    assert.ok(h.engine.interrupts.length >= 1, "超时必须真的 turn/interrupt，不能只发回执")
+    const observation = await waitFor(() => receiptRecords(h.relay).find((r) => r.r.kind === "observation" && r.r.nonce === "f003"))
+    assert.equal(h.engine.interrupts.length, 0)
+    const done = await waitFor(() => receiptRecords(h.relay).find((r) => r.r.kind === "done" && r.r.nonce === "f003"))
+    assert.equal(done.rec.replyTo, observation.rec.replyTo)
+    assert.equal(h.engine.interrupts.length, 0)
+    assert.equal(receipts(h.relay).filter((r) => r.kind === "failed" && r.nonce === "f003").length, 0)
+    assert.equal(h.wal().filter((r) => r.op === "observing" && r.nonce === "f003").length, 1)
   } finally { await h.stop() }
 })
 
@@ -636,7 +739,7 @@ test("WAL P3 变异：fault disable-wal-replay 下那条消息不再被执行（
   } finally { await h.stop() }
 })
 
-test("WAL P4：started 未 completed → 不重跑，发 [failed] interrupted-by-restart", async () => {
+test("WAL P4: restart retains original turn awaiting confirmation and never resubmits input", async () => {
   // 注入：把 P4 也当成 fetched 重放 → 会重跑 turn（有副作用）→ turnCalls>0 断言红
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-seat-home-"))
   const paths = seatPaths(SEAT, home)
@@ -648,11 +751,8 @@ test("WAL P4：started 未 completed → 不重跑，发 [failed] interrupted-by
   seedState(paths, { cursor: 8 })
   const h = await start({ home })
   try {
-    const failed = await waitFor(
-      () => receipts(h.relay).find((r) => r.kind === "failed" && r.nonce === "p4nonce"),
-      5000, "interrupted-by-restart",
-    ) as Extract<Receipt, { kind: "failed" }>
-    assert.equal(failed.reason, "interrupted-by-restart" satisfies FailReason)
+    await waitFor(() => receipts(h.relay).find((r) => r.kind === "observation" && r.nonce === "p4nonce"))
+    assert.equal(receipts(h.relay).filter((r) => r.kind === "failed").length, 0)
     await sleep(100)
     assert.equal(h.engine.turnCalls.length, 0, "at-most-once：started 过的 turn 绝不重跑")
   } finally { await h.stop() }

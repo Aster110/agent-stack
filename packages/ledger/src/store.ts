@@ -898,6 +898,18 @@ export class LedgerStore {
     return info.changes > 0
   }
 
+  findTaskReplies(taskId: string): LedgerMessageRow[] {
+    return (this.db.prepare(`SELECT * FROM ledger_messages WHERE reply_to = ? AND type IN ('system','result') ORDER BY created_at_utc ASC, rowid ASC`).all(taskId) as unknown[]).map((r) => this.toMessageRow(r))
+  }
+
+  legacyTimeoutTaskIds(): string[] {
+    return (this.db.prepare(`SELECT DISTINCT reply_to AS id FROM ledger_messages WHERE payload LIKE '[failed]%reason=timeout%' AND reply_to IS NOT NULL`).all() as Array<{ id: string }>).map((r) => r.id)
+  }
+
+  projectTaskState(taskId: string, state: string, replyMsgId: string | null, repliedAt: string | null): void {
+    this.db.prepare(`UPDATE tasks SET status = ?, reply_msg_id = ?, replied_at = ? WHERE task_id = ?`).run(state, replyMsgId, repliedAt, taskId)
+  }
+
   markTaskOrphaned(taskId: string): boolean {
     const info = this.db.prepare(
       `UPDATE tasks SET status = 'orphaned' WHERE task_id = ? AND status = 'dispatched'`,

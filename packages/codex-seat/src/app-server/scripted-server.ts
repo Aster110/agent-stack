@@ -61,6 +61,7 @@ export interface ScriptedServerScript {
   /** 前几次提交被独立 Compact turn 占用；模拟 ACK 前到达的外来通知。 */
   compactBusyAttempts?: number
   turnAckDelayMs?: number
+  dropCompleted?: boolean
   turn: ScriptedTurn
 }
 
@@ -132,6 +133,7 @@ function main(): void {
   const threads = new Set<string>()
   const completionTimers = new Map<string, NodeJS.Timeout>()
   const turnThread = new Map<string, string>()
+  const turnSnapshots = new Map<string, Record<string, any>>()
 
   const t = script.turn ?? {}
 
@@ -156,6 +158,9 @@ function main(): void {
     const timer = setTimeout(() => {
       completionTimers.delete(turnId)
       const status = t.status ?? "completed"
+      const snapshot = turnSnapshots.get(turnId)
+      if (snapshot) { snapshot.status = status; snapshot.items.push(...(t.items ?? [])); snapshot.error = status === "failed" ? { message: t.errorMessage ?? "scripted failure" } : null }
+      if (script.dropCompleted) return
       notify("turn/completed", {
         threadId,
         turn: {
@@ -218,6 +223,7 @@ function main(): void {
         }
         const turnId = `tu-${++turnSeq}`
         const threadId = String(msg.params?.threadId ?? "")
+        turnSnapshots.set(turnId, { id: turnId, status: "inProgress", items: [{ type: "userMessage", content: msg.params?.input ?? [] }] })
         if (script.turnAckDelayMs) setTimeout(() => reply(msg.id, { turn: { id: turnId, status: "inProgress", items: [] } }), script.turnAckDelayMs)
         else reply(msg.id, { turn: { id: turnId, status: "inProgress", items: [] } })
         runTurn(threadId, turnId)
@@ -241,6 +247,10 @@ function main(): void {
 
       case "thread/loaded/list":
         reply(msg.id, { data: [...threads], nextCursor: null })
+        return
+
+      case "thread/read":
+        reply(msg.id, { thread: { id: msg.params?.threadId, turns: [...turnSnapshots.values()].filter((t) => turnThread.get(t.id) === msg.params?.threadId) } })
         return
 
       case "thread/compact/start":

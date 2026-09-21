@@ -27,6 +27,35 @@ function taskMsg(id: string, over: Partial<MeshMessage> = {}): MeshMessage {
 }
 
 describe("Projector · task 开单", () => {
+  it("observation/legacy timeout are nonterminal; late results and explicit failures retain original task", () => {
+    const { store, proj } = fresh()
+    const send = (id: string, payload: string, type: "system" | "result" = "system", task = "long") => proj.ingest([mkEvent(mkMsg({ id, type, payload, from: "mini:cc-w1", to: "macbook:cc-main", replyTo: task, createdAt: `2026-09-20T00:00:${String(Number(id.replace(/\D/g, ""))).padStart(2, "0")}Z` }))], "r")
+    send("r01", "[failed] nonce=n node=mini:cc-w1 reason=timeout detail=turn exceeded 1800000ms")
+    proj.ingest([mkEvent(taskMsg("long"))], "r")
+    assert.equal(store.getTask("long")!.status, "awaiting_confirmation")
+    assert.equal(store.getTask("long")!.repliedAt, null)
+    store.projectTaskState("long", "failed", "r01", "old")
+    new Projector(store)
+    assert.equal(store.getTask("long")!.status, "awaiting_confirmation", "startup normalizes legacy stored timeout failures")
+    send("r02", "[observation] nonce=n node=mini:cc-w1 thread=t turn=u state=running")
+    assert.equal(store.getTask("long")!.status, "running")
+    send("r03", "[observation] nonce=n node=mini:cc-w1 thread=t turn=u state=awaiting_confirmation")
+    assert.equal(store.getTask("long")!.status, "awaiting_confirmation")
+    send("r04", "late result", "result")
+    send("r05", "[observation] nonce=n node=mini:cc-w1 thread=t turn=u state=awaiting_confirmation")
+    send("r05", "[observation] nonce=n node=mini:cc-w1 thread=t turn=u state=awaiting_confirmation")
+    assert.equal(store.getTask("long")!.status, "replied")
+    assert.equal(store.getTask("long")!.replyMsgId, "r04")
+    store.projectTaskState("long", "replied", "already-pruned-receipt", "2026-09-19T00:00:00Z")
+    proj.ingest([mkEvent(taskMsg("pruned"))], "r")
+    store.projectTaskState("pruned", "replied", "already-pruned-receipt", "2026-09-19T00:00:00Z")
+    send("r07", "[observation] nonce=n node=mini:cc-w1 thread=t turn=u state=awaiting_confirmation", "system", "pruned")
+    assert.equal(store.getTask("pruned")!.status, "replied")
+    proj.ingest([mkEvent(taskMsg("explicit"))], "r")
+    send("r06", "[failed] nonce=n node=mini:cc-w1 reason=interrupted detail=executor cancelled", "system", "explicit")
+    assert.equal(store.getTask("explicit")!.status, "failed")
+    store.close()
+  })
   it("type=task → tasks 行 status=dispatched，元数据从 meta._task 取", () => {
     const { store, proj } = fresh()
     const msg = taskMsg("t1", {
