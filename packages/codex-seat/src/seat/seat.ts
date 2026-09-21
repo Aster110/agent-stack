@@ -210,7 +210,8 @@ class Seat implements SeatHandle {
   private readonly observationDelivered = new Set<string>()
   private readonly observationInFlight = new Set<string>()
   private readonly snapshotOutcomes = new Map<string, (outcome: TurnOutcome) => void>()
-  private readonly recovering = new Map<string, { msg: Incoming; threadId: string; turnId: string }>()
+  /** released: the engine snapshot is terminal (interrupted / not on the thread) — the task stays observing but no longer holds the thread lock; re-reads back off instead of hitting the engine every tick. */
+  private readonly recovering = new Map<string, { msg: Incoming; threadId: string; turnId: string; released?: boolean; nextReadAt?: number; readAttempts?: number }>()
   private recoveryTimer: NodeJS.Timeout | null = null
   private reconciling = false
   private readonly compacting = new Set<string>()
@@ -537,6 +538,8 @@ class Seat implements SeatHandle {
 
   /** 锚定失败的重试节奏：relay 起得比席位慢是常态，但也不能无限等（launchd 会重拉我们）。 */
   private static readonly ANCHOR_RETRY_MS = [300, 1000, 3000, 5000]
+  /** Re-read schedule for a recovered turn whose snapshot did not settle it: next tick, then doubling to 5 min. One thread/read of an 8 GB rollout costs seconds — reading it every 5 s tick is what burned air2. */
+  private static readonly RECOVERY_READ_BACKOFF_MS = [0, 5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000]
   /** 一次锚定最多翻多少页（limit=100 时够 100 万条；纯粹防死循环）。 */
   private static readonly ANCHOR_MAX_PAGES = 10_000
 
@@ -1003,7 +1006,11 @@ class Seat implements SeatHandle {
     }
 
     return await this.withThreadLock(threadId, async () => {
-      while ([...this.recovering.values()].some((a) => a.threadId === threadId)) {
+      // An uncertain earlier turn still owns the thread. Submitting here would
+      // steer it or repeat side effects after a sidecar restart. A turn whose
+      // engine snapshot is already terminal (released) cannot be steered: its task
+      // stays observing, but it must not park every later turn on this thread.
+      while ([...this.recovering.values()].some((a) => a.threadId === threadId && !a.released)) {
         if (this.stopped) return
         await sleep(100)
       }
@@ -1151,6 +1158,8 @@ class Seat implements SeatHandle {
       try {
         for (const a of [...this.recovering.values()]) {
           await this.deliverObservation(a.msg, a.threadId, a.turnId)
+          // Unsettled entries are re-read on a backoff schedule, not every tick.
+          if (a.nextReadAt != null && Date.now() < a.nextReadAt) continue
           await this.reconcileRecovered(a)
         }
       } finally { this.reconciling = false }
@@ -1160,7 +1169,15 @@ class Seat implements SeatHandle {
     void reconcile()
   }
 
-  private async reconcileRecovered(a: { msg: Incoming; threadId: string; turnId: string }): Promise<void> {
+  /** Schedule the next read: next tick first, then doubling up to 5 min. */
+  private deferRecoveryRead(a: { msg: Incoming; threadId: string; readAttempts?: number; nextReadAt?: number }, reason: string): void {
+    a.readAttempts = (a.readAttempts ?? 0) + 1
+    const wait = Seat.RECOVERY_READ_BACKOFF_MS[Math.min(a.readAttempts - 1, Seat.RECOVERY_READ_BACKOFF_MS.length - 1)]!
+    a.nextReadAt = Date.now() + wait
+    this.log({ event: "recovery-read-deferred", msgId: a.msg.msgId, threadId: a.threadId, reason, retryInMs: wait })
+  }
+
+  private async reconcileRecovered(a: { msg: Incoming; threadId: string; turnId: string; released?: boolean; nextReadAt?: number; readAttempts?: number }): Promise<void> {
     if (!this.engine.readTurn || !this.recovering.has(a.msg.msgId)) return
     try {
       const outcome = await this.engine.readTurn(a.threadId, a.turnId, a.msg.msgId)
@@ -1169,7 +1186,7 @@ class Seat implements SeatHandle {
         a.turnId = outcome.turnId
         if (outcome.status === "running") this.appendWal(this.walFor(a.msg, "started", { threadId: a.threadId, turnId: a.turnId }))
       }
-      if (outcome.status === "running") { this.noteActivity(a.msg, a.threadId, a.turnId); return }
+      if (outcome.status === "running") { a.readAttempts = 0; a.nextReadAt = undefined; this.noteActivity(a.msg, a.threadId, a.turnId); return }
       const resolve = this.snapshotOutcomes.get(a.msg.msgId)
       if (resolve && (outcome.status === "completed" || outcome.status === "failed")) { resolve(outcome); return }
       if (outcome.status === "completed") {
@@ -1183,8 +1200,30 @@ class Seat implements SeatHandle {
       } else if (outcome.status === "failed") {
         this.recovering.delete(a.msg.msgId)
         await this.finishFailed(a.msg, "turn-failed", outcome.message)
+      } else if (outcome.status === "interrupted" || (outcome.status === "unknown" && outcome.reason === "not-found")) {
+        // A historical interrupted snapshot may have been caused by the old
+        // deadline or a process restart; a turn missing from the thread was never
+        // (or is no longer) running there. Neither is evidence that the executor
+        // cancelled the business task, so the task stays observing. But nothing
+        // can steer such a turn any more, so it must not keep the thread lock
+        // (2026-09-21 air2: two legacy timeouts on the live thread parked every
+        // new turn forever) and there is nothing left to re-read.
+        const snapshot = outcome.status === "unknown" ? "not-found" : "interrupted"
+        if (!a.released) {
+          a.released = true
+          this.log({ event: "recovery-thread-released", msgId: a.msg.msgId, threadId: a.threadId, turnId: a.turnId, snapshot })
+        }
+        // A later read may still surface a completed snapshot (the confirmation can
+        // arrive after an interrupted one), so keep polling — on the backoff schedule.
+        this.deferRecoveryRead(a, snapshot)
+      } else if (outcome.status === "unknown") {
+        // thread/read failed or returned an unrecognised turn: keep holding the lock, retry later.
+        this.deferRecoveryRead(a, outcome.reason ?? "unknown")
       }
-    } catch (err) { this.log({ event: "recovery-read-unavailable", msgId: a.msg.msgId, error: String(err) }) }
+    } catch (err) {
+      this.deferRecoveryRead(a, "read-error")
+      this.log({ event: "recovery-read-unavailable", msgId: a.msg.msgId, error: String(err) })
+    }
   }
 
   private maybeCompact(threadId: string, ratio: number): void {

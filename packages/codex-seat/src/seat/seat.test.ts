@@ -158,6 +158,93 @@ test("legacy timeout WAL survives two restarts, deduplicates confirmation, and r
   } finally { await h2.stop() }
 })
 
+// 2026-09-21 air2 事故：两条旧 timeout（旧 sidecar 已 interrupt 的 turn）挂在活的主 thread 上，
+// 升级后被折成 observing 放进 recovering，runTurn 对同 thread 一律等待 → 新消息永远起不了 turn；
+// 且每 5 秒 thread/read 一次 8 GB rollout。任务保持 observing 是对的，占锁与反复重读是错的。
+test("legacy interrupted turn on the live thread keeps observing, releases the lock and re-reads with backoff", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-seat-legacy-live-"))
+  const paths = seatPaths(SEAT, home)
+  const at = new Date().toISOString()
+  const common = { msgId: "legacy-live", seq: 9, to: `e2edev:${SEAT}`, from: PROBE, nonce: "legacylive", at }
+  seedWal(paths, [
+    { ...common, op: "fetched", payload: "must never resubmit" },
+    { ...common, op: "started", threadId: "live-thread", turnId: "legacy-turn" },
+    { ...common, op: "failed", reason: "timeout", detail: "turn exceeded 1800000ms" },
+  ])
+  // cursor 0: the fake relay numbers fresh deliveries from seq 1, a seeded cursor of 9 would hide the new task
+  // resumableThreads: without it the seat starts a fresh thread and the legacy entry would not share it
+  seedState(paths, { cursor: 0, mainThreadId: "live-thread", resumableThreads: ["live-thread"] })
+  const engine = new SpyEngine(new FakeAppServerClient({ scenario: {} }))
+  const reads: string[][] = []
+  engine.readTurn = async (threadId, turnId) => { reads.push([threadId, turnId]); return { status: "interrupted", turnId, wallMs: 0 } }
+  const h = await start({ home, engine })
+  try {
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "observation" && r.state === "awaiting_confirmation"))
+    await waitFor(() => h.logs.find((l) => l.event === "recovery-thread-released" && l.msgId === "legacy-live" && l.snapshot === "interrupted"))
+    const task = h.relay.deliver(h.nodeId, PROBE, "after-upgrade nonce=afterupgrade")
+    const done = await waitFor(() => receiptRecords(h.relay).find((r) => r.r.kind === "done"))
+    assert.equal(done.rec.replyTo, task)
+    assert.equal(h.engine.turnCalls.length, 1)
+    assert.equal(h.engine.turnCalls[0].threadId, "live-thread")
+    assert.equal(h.engine.interrupts.length, 0)
+    // the legacy task is still observing: no terminal receipt, still counted, WAL untouched beyond observing/observation-sent
+    assert.equal(receiptRecords(h.relay).filter((r) => r.rec.replyTo === "legacy-live" && r.r.kind !== "observation").length, 0)
+    assert.equal(receipts(h.relay).filter((r) => r.kind === "observation").length, 1)
+    assert.equal((await h.seat.status()).wal.started, 1)
+    assert.equal(h.wal().filter((e) => e.msgId === "legacy-live" && (e.op === "submitting" || e.op === "completed" || e.op === "receipted")).length, 0)
+    // re-reads back off instead of firing every 5 s tick: after ~5.5 s exactly two reads
+    // (t0 and the next tick), and the last deferral already waits a full tick more.
+    await sleep(5_500)
+    assert.equal(reads.length, 2)
+    assert.deepEqual(reads[0], ["live-thread", "legacy-turn"])
+    const deferrals = h.logs.filter((l) => l.event === "recovery-read-deferred" && l.msgId === "legacy-live")
+    assert.deepEqual(deferrals.map((l) => l.retryInMs), [0, 5_000])
+    assert.equal(h.logs.filter((l) => l.event === "recovery-thread-released").length, 1)
+  } finally { await h.stop() }
+})
+
+test("recovered turn missing from the thread releases the lock; a failed thread read keeps holding and backs off", async () => {
+  const seed = (dir: string): string => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), dir))
+    const paths = seatPaths(SEAT, home)
+    const common = { msgId: "legacy-live", seq: 9, to: `e2edev:${SEAT}`, from: PROBE, nonce: "legacylive", at: new Date().toISOString() }
+    seedWal(paths, [
+      { ...common, op: "fetched", payload: "must never resubmit" },
+      { ...common, op: "started", threadId: "live-thread", turnId: "legacy-turn" },
+      { ...common, op: "failed", reason: "timeout", detail: "turn exceeded 1800000ms" },
+    ])
+    seedState(paths, { cursor: 0, mainThreadId: "live-thread", resumableThreads: ["live-thread"] })
+    return home
+  }
+  // not-found: the turn is not on the thread at all → nothing to steer → lock released
+  const e1 = new SpyEngine(new FakeAppServerClient({ scenario: {} }))
+  const reads1: string[][] = []
+  e1.readTurn = async (threadId, turnId) => { reads1.push([threadId, turnId]); return { status: "unknown", reason: "not-found" } }
+  const h1 = await start({ home: seed("codex-seat-legacy-notfound-"), engine: e1 })
+  try {
+    await waitFor(() => h1.logs.find((l) => l.event === "recovery-thread-released" && l.snapshot === "not-found"))
+    const task = h1.relay.deliver(h1.nodeId, PROBE, "after-upgrade nonce=afterupgrade2")
+    const done = await waitFor(() => receiptRecords(h1.relay).find((r) => r.r.kind === "done"))
+    assert.equal(done.rec.replyTo, task)
+    assert.deepEqual(reads1, [["live-thread", "legacy-turn"]])
+    assert.equal((await h1.seat.status()).wal.started, 1)
+  } finally { await h1.stop() }
+  // read-error: we know nothing → keep holding the thread, but retry with backoff instead of every tick
+  const e2 = new SpyEngine(new FakeAppServerClient({ scenario: {} }))
+  const reads2: string[][] = []
+  e2.readTurn = async (threadId, turnId) => { reads2.push([threadId, turnId]); return { status: "unknown", reason: "read-error" } }
+  const h2 = await start({ home: seed("codex-seat-legacy-readerror-"), engine: e2 })
+  try {
+    await waitFor(() => h2.logs.find((l) => l.event === "recovery-read-deferred" && l.reason === "read-error"))
+    const task = h2.relay.deliver(h2.nodeId, PROBE, "after-upgrade nonce=afterupgrade3")
+    await sleep(400)
+    assert.equal(e2.turnCalls.length, 0)
+    assert.equal(h2.wal().some((e) => e.msgId === task && e.op === "submitting"), false)
+    assert.deepEqual(reads2, [["live-thread", "legacy-turn"]])
+    assert.equal(h2.logs.some((l) => l.event === "recovery-thread-released"), false)
+  } finally { await h2.stop() }
+})
+
 test("activity after observation restores running and confirmation remains once", async () => {
   const h = await start({ configPatch: { turn: { timeoutMs: 50 } }, scenario: { defaultTurn: { completeAfterMs: 300 } } })
   try {

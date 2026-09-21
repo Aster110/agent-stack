@@ -130,7 +130,7 @@ export class SpyEngine implements IAppServerClient {
     return await this.inner.compact(threadId, timeoutMs)
   }
 
-  async readTurn(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown" }> {
+  async readTurn(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown"; reason?: "not-found" | "read-error" }> {
     return this.inner.readTurn ? this.inner.readTurn(threadId, turnId, msgId) : { status: "unknown" }
   }
 }
