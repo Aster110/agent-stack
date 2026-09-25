@@ -1,8 +1,9 @@
 import {createHash} from 'node:crypto'
+import path from 'node:path'
 import {getUpdates,sendMessage} from '@cc-mesh/wechat-transport/api'
-import {extractText} from '@cc-mesh/wechat-transport/utils'
 import type {SeatChannel,SeatHandle,ChannelOutput} from '@cc-mesh/codex-seat'
 import {WeChatStore} from './wechat-store.js'
+import {WeChatMedia,type WeChatMediaOptions} from './wechat-media.js'
 
 export interface WeChatAccount {accountId:string;token:string;baseUrl?:string}
 export interface WeChatApi {poll:typeof getUpdates;send:typeof sendMessage}
@@ -16,8 +17,13 @@ export class DurableWeChatChannel implements SeatChannel {
   private failure:string|null=null
   private failures=0
   private seat:SeatHandle|null=null
+  private sweeper:NodeJS.Timeout|null=null
+  private readonly media:WeChatMedia
+  /** Media lands in `wechat-media` beside the store unless the runtime names another private directory. */
   constructor(readonly ownerId:string,private account:WeChatAccount,readonly store:WeChatStore,
-    private api:WeChatApi={poll:getUpdates,send:sendMessage}){}
+    private api:WeChatApi={poll:getUpdates,send:sendMessage},media?:WeChatMediaOptions){
+    this.media=new WeChatMedia(store,media??{dir:path.join(path.dirname(store.file),'wechat-media')})
+  }
   accepts(endpoint:string):boolean{return endpoint===this.ownerId}
   async send(endpoint:string,output:ChannelOutput):Promise<void>{
     if(!this.accepts(endpoint))throw new Error('WeChat endpoint not allowed')
@@ -34,21 +40,27 @@ export class DurableWeChatChannel implements SeatChannel {
     }
   }
   start(seat:SeatHandle):void {
-    this.seat=seat;this.pump()
+    this.seat=seat;this.sweepMedia();this.pump()
     this.intake=setInterval(()=>this.pump(),250)
+    this.sweeper=setInterval(()=>this.sweepMedia(),10*60_000);this.sweeper.unref?.()
     this.loop=this.poll()
   }
+  /** In order: a message whose attachments are still downloading holds back the ones after it. */
   private pump():void {
     if(this.stopped||!this.seat)return
     for(const message of this.store.pending()){
-      // Candidate text path: do not silently fabricate attachment contents.
-      const unsupported=message.raw.item_list?.some(i=>i.type!==1 && !(i.type===3 && i.voice_item?.text))
-      const text=extractText(message.raw)+(unsupported?'\n[通道提示：本条还有附件，当前通道尚未下载附件内容。请如实说明限制，不要假装已读。]':'')
+      const input=this.media.prepare(message.id,message.raw,()=>this.pump())
+      if(!input)break
       try{
-        this.seat.deliver({channel:'wechat',endpointId:this.ownerId,id:message.id,text})
+        this.seat.deliver({channel:'wechat',endpointId:this.ownerId,id:message.id,text:input.text,...(input.images.length?{images:input.images}:{})})
         this.store.accepted(message.id)
       }catch(error){this.failure=String(error);break}
     }
+  }
+  /** TTL cleanup of downloaded media; runs at start and every ten minutes. */
+  sweepMedia():void {
+    if(this.stopped)return
+    try{this.media.sweep()}catch(error){this.failure=`media sweep failed: ${String(error)}`}
   }
   private async pause(ms:number):Promise<void>{
     if(this.stopped)return
@@ -73,9 +85,9 @@ export class DurableWeChatChannel implements SeatChannel {
       }
     }
   }
-  health(){return {ok:!this.stopped&&!this.failure,error:this.failure,failures:this.failures,pending:this.stopped?null:this.store.pending().length}}
+  health(){return {ok:!this.stopped&&!this.failure,error:this.failure,failures:this.failures,pending:this.stopped?null:this.store.pending().length,media:this.stopped?null:this.media.health()}}
   async stop():Promise<void>{
-    this.stopped=true;this.abort.abort();this.wake?.();if(this.intake)clearInterval(this.intake)
+    this.stopped=true;this.abort.abort();this.media.stop();this.wake?.();if(this.intake)clearInterval(this.intake);if(this.sweeper)clearInterval(this.sweeper)
     // In-flight platform request may finish later; it checks stopped before touching the store.
     this.store.close()
   }

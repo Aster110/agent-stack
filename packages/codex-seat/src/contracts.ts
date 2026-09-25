@@ -440,6 +440,8 @@ export interface WalEntry {
   detail?: string
   /** fetched 才有：消息原文（重启重放要拿它重新投给引擎，不截断） */
   payload?: string
+  /** fetched 才有：随正文一起送给模型的本地图片（绝对路径，按正文引用顺序）。旧 WAL 没有这个字段。 */
+  images?: string[]
   /** 原始传输元数据；旧 WAL 缺失时不凭正文猜测。 */
   messageType?: string
   replyTo?: string
@@ -463,6 +465,8 @@ export interface WalFolded {
   finalText?: string
   /** fetched 条目里的消息原文（重放用） */
   payload?: string
+  /** fetched 条目里的本地图片（重放用） */
+  images?: string[]
   /** 原始传输元数据；旧 WAL 缺失时不凭正文猜测。 */
   messageType?: string
   replyTo?: string
@@ -481,7 +485,7 @@ export function foldWal(entries: readonly WalEntry[]): Map<string, WalFolded> {
   for (const e of entries) {
     const cur = out.get(e.msgId)
     if (e.op === "fetched") {
-      if (!cur) out.set(e.msgId, { msgId: e.msgId, seq: e.seq, to: e.to, from: e.from, nonce: e.nonce, phase: "fetched", payload: e.payload, ...(e.messageType ? { messageType: e.messageType } : {}), ...(e.replyTo ? { replyTo: e.replyTo } : {}), ...(e.replyRoute ? { replyRoute: e.replyRoute } : {}), fetchedAt: e.at })
+      if (!cur) out.set(e.msgId, { msgId: e.msgId, seq: e.seq, to: e.to, from: e.from, nonce: e.nonce, phase: "fetched", payload: e.payload, ...(e.images?.length ? { images: e.images } : {}), ...(e.messageType ? { messageType: e.messageType } : {}), ...(e.replyTo ? { replyTo: e.replyTo } : {}), ...(e.replyRoute ? { replyRoute: e.replyRoute } : {}), fetchedAt: e.at })
       continue
     }
     if (!cur) continue // 没有 fetched 的孤儿事件：忽略（文件截断/手改）
@@ -844,6 +848,8 @@ export interface ThreadInfo {
 export interface TurnStartRequest {
   threadId: string
   text: string
+  /** Absolute local image paths sent after the text as native `localImage` input, in order. Omitted when there are none. */
+  images?: string[]
   /** 只用于日志/证据关联 */
   nonce: string
   msgId: string

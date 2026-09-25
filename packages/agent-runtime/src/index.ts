@@ -5,6 +5,7 @@ import Database from 'better-sqlite3'
 import {runSeat,resolveSeatConfig,atomicWriteFileSync,type SeatRuntimeOptions,type SeatHandle} from '@cc-mesh/codex-seat'
 import {DurableWeChatChannel,type WeChatAccount,type WeChatApi} from './wechat.js'
 import {WeChatStore} from './wechat-store.js'
+import type {WeChatMediaOptions} from './wechat-media.js'
 import {RuntimeLease} from './runtime-lease.js'
 import {BrainHttpChannel,BrainHttpStore,BRAIN_HTTP_CHANNEL,DEFAULT_PORT as BRAIN_HTTP_DEFAULT_PORT} from './brain-http.js'
 import type {SeatChannel} from '@cc-mesh/codex-seat'
@@ -22,7 +23,8 @@ export interface RuntimeConfig {
   codex:{bin:string;home?:string;model?:string;reasoningEffort?:string}
   /** This candidate retains the existing engine policy, so acknowledgement is explicit. */
   executionPolicy:'full-access'
-  wechat?:{accountFile:string;ownerId:string}
+  /** mediaTtlHours: how long downloaded owner photos/files stay in stateRoot/wechat-media (default 72). */
+  wechat?:{accountFile:string;ownerId:string;mediaTtlHours?:number}
   /** Third brain channel: loopback HTTP for voice/chat clients, fronted by a tunnel. Brain role only. */
   brainChannel?:{tokenFile:string;port?:number;stateFile?:string}
 }
@@ -40,6 +42,7 @@ export function validateRuntimeConfig(value:unknown):RuntimeConfig {
   if(c.healthPort!==undefined&&(!Number.isInteger(c.healthPort)||c.healthPort<1||c.healthPort>65535))throw new Error('invalid healthPort')
   if(c.wechat&&(c.role!=='brain'||!path.isAbsolute(c.wechat.accountFile)||!c.wechat.ownerId))throw new Error('WeChat requires brain role, account file and explicit owner')
   if(c.wechat&&(!c.relayDatabase||!path.isAbsolute(c.relayDatabase)))throw new Error('brain needs local relayDatabase to correlate task results')
+  if(c.wechat?.mediaTtlHours!==undefined&&(!Number.isInteger(c.wechat.mediaTtlHours)||c.wechat.mediaTtlHours<1||c.wechat.mediaTtlHours>720))throw new Error('wechat.mediaTtlHours must be an integer from 1 to 720')
   if(c.brainChannel){
     if(c.role!=='brain')throw new Error('brainChannel requires brain role')
     if(!path.isAbsolute(c.brainChannel.tokenFile))throw new Error('brainChannel.tokenFile must be absolute')
@@ -49,7 +52,7 @@ export function validateRuntimeConfig(value:unknown):RuntimeConfig {
   }
   return c
 }
-export interface RuntimeOptions {seat?:SeatRuntimeOptions;wechatApi?:WeChatApi}
+export interface RuntimeOptions {seat?:SeatRuntimeOptions;wechatApi?:WeChatApi;wechatMedia?:Partial<WeChatMediaOptions>}
 export interface UnifiedRuntime {seat:SeatHandle;wechat:DurableWeChatChannel|null;brainHttp:BrainHttpChannel|null;stop():Promise<void>}
 /** The token is a private local file: it grants owner-level conversation, so a group/world readable file is a refusal. */
 function readChannelToken(file:string):string{
@@ -84,7 +87,9 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
       if(!account.accountId||!account.token)throw new Error('invalid WeChat account file')
       taskDb=new Database(c.relayDatabase!,{readonly:true,fileMustExist:true})
       const store=new WeChatStore(path.join(c.stateRoot,'wechat.sqlite'),account.accountId,c.wechat.ownerId)
-      channel=new DurableWeChatChannel(c.wechat.ownerId,account,store,options.wechatApi)
+      // Owner media stays inside the private state root; the service log gets sizes and hashes only.
+      channel=new DurableWeChatChannel(c.wechat.ownerId,account,store,options.wechatApi,{dir:path.join(c.stateRoot,'wechat-media'),
+        ttlMs:(c.wechat.mediaTtlHours??72)*3600_000,log:record=>console.log(JSON.stringify(record)),...options.wechatMedia})
     }
     if(c.brainChannel){
       brainHttp=new BrainHttpChannel({token:readChannelToken(c.brainChannel.tokenFile),
@@ -108,6 +113,7 @@ export async function startUnifiedRuntime(input:RuntimeConfig,options:RuntimeOpt
         'The runtime exclusively receives your inbox. Do not run mesh inbox/sync/recv/listen or poll your own relay to wait for results.',
         c.role==='brain'?'After dispatching work, immediately finish the current turn with a short dispatch acknowledgement. Do not block, sleep or poll for completion: the runtime queues the verified peer result as the next input in this same conversation, and you report completion in that later turn.': '',
         c.role==='brain'?'Coordinate tasks across configured peers. A later correlated task result returns to this same conversation and is reported to the owner.':'Complete assigned work in the configured workspace and return evidence.',
+        c.wechat?'Owner WeChat photos and files are downloaded before the turn: the message text lists each one in its original position with MIME, size, SHA-256 and a private local path, and photos are also attached to the turn as images. Use that path when a peer needs the same file; it is deleted automatically at the stated time.':'',
       ].join('\n'),
       ...(Object.keys(channels).length?{channels}:{}),
       ...(channel?{brainResultRoute:{channel:'wechat',endpointId:c.wechat!.ownerId},

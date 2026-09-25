@@ -135,6 +135,10 @@ interface Incoming {
   messageType?: string
   replyTo?: string
   replyRoute?: ReplyRoute
+  /** Validated absolute local image paths; native image input of this message's turn. */
+  images?: string[]
+  /** Set when the engine refused the image input once; the retry runs as text only. */
+  imagesRefused?: string
 }
 
 interface SyncLoopHandle {
@@ -258,6 +262,7 @@ class Seat implements SeatHandle {
     const channel = this.opts.channels?.[input.channel]
     if (!channel || !channel.accepts(input.endpointId)) throw new Error("channel endpoint not allowed")
     if (!input.id || !input.text.trim()) throw new Error("channel message id and text required")
+    const images = checkedImagePaths(input.images)
     const msgId = `channel:${input.channel}:${createHash("sha256").update(JSON.stringify([input.endpointId, input.id])).digest("hex")}`
     if (this.st.channelAcceptedIds?.includes(msgId) || this.st.recentMsgIds.includes(msgId) || this.wal.fold().has(msgId)) return "duplicate"
     if ((this.st.channelAcceptedIds?.length ?? 0) >= 100_000) throw new Error("channel durable dedupe capacity reached; archive through a reviewed migration")
@@ -267,8 +272,9 @@ class Seat implements SeatHandle {
       from: `${input.channel}:${createHash("sha256").update(input.endpointId).digest("hex").slice(0, 24)}`,
       payload: input.text, nonce: extractNonce(input.text, msgId),
       replyRoute: { channel: input.channel, endpointId: input.endpointId },
+      ...(images ? { images } : {}),
     }
-    this.appendWal(this.walFor(msg, "fetched", { payload: msg.payload }))
+    this.appendWal(this.walFor(msg, "fetched", fetchedExtra(msg)))
     ;(this.st.channelAcceptedIds ??= []).push(msgId)
     rememberMsgIds(this.st, [msgId])
     this.saveState()
@@ -500,6 +506,7 @@ class Seat implements SeatHandle {
       const msg: Incoming = {
         msgId: f.msgId, seq: f.seq, to: f.to, from: f.from,
         payload: payloads.get(f.msgId) ?? "", nonce: f.nonce, messageType: f.messageType, replyTo: f.replyTo, replyRoute: f.replyRoute,
+        ...(f.images?.length ? { images: f.images } : {}),
       }
       if (this.consumeMachineReceipt(msg)) continue
       if (f.phase === "fetched") {
@@ -755,7 +762,7 @@ class Seat implements SeatHandle {
         })
       }
       // 先写 WAL，再谈推进 since。正文进 payload，重放才有东西可跑。
-      for (const msg of fresh) this.appendWal(this.walFor(msg, "fetched", { payload: msg.payload }))
+      for (const msg of fresh) this.appendWal(this.walFor(msg, "fetched", fetchedExtra(msg)))
 
       if (this.fault("crash-after-fetch-before-ack") && batch.messages.length > 0) {
         this.log({ event: "fault-crash", fault: "crash-after-fetch-before-ack", exit: 70 })
@@ -817,7 +824,7 @@ class Seat implements SeatHandle {
       if (this.inflight >= this.opts.maxInflight) return
       if (f.phase !== "fetched" || this.scheduled.has(f.msgId) || this.blockedDispatch.has(f.msgId) || !f.payload) continue
       this.dispatch({msgId:f.msgId,seq:f.seq,to:f.to,from:f.from,payload:f.payload,nonce:f.nonce,
-        messageType:f.messageType,replyTo:f.replyTo,replyRoute:f.replyRoute})
+        messageType:f.messageType,replyTo:f.replyTo,replyRoute:f.replyRoute,...(f.images?.length ? { images: f.images } : {})})
     }
   }
 
@@ -1022,6 +1029,8 @@ class Seat implements SeatHandle {
     if (this.stopped) { await this.finishFailed(msg, "shutdown", "seat stopped before turn submission"); return }
     const t0 = Date.now()
     let handle: TurnHandle
+    const media = usableImages(msg.images)
+    const refused = msg.imagesRefused ? `\n[图片未能作为原生输入（引擎拒绝：${shortDetail(msg.imagesRefused)}）；正文照常，图片路径见上文，可用工具读取。]` : ""
     try {
       this.appendWal(this.walFor(msg, "submitting", { threadId }))
       this.markResumable(threadId)
@@ -1029,7 +1038,8 @@ class Seat implements SeatHandle {
       handle = await this.engine.turnStart({
         threadId,
         // 与 inject 形态的 formatDelivery 同款前缀：让模型知道谁在说话。
-        text: `[mesh:${msg.from}] ${msg.payload}\n[mesh-task-id:${msg.msgId}]`,
+        text: `[mesh:${msg.from}] ${msg.payload}${media.note}${refused}\n[mesh-task-id:${msg.msgId}]`,
+        ...(media.images.length ? { images: media.images } : {}),
         nonce: msg.nonce,
         msgId: msg.msgId,
         timeoutMs: 0,
@@ -1104,7 +1114,14 @@ class Seat implements SeatHandle {
         await this.observe(msg, threadId, handle.turnId)
         this.startRecovery()
         return
-      case "rejected": await this.finishFailed(msg, "turn-start-failed", `${outcome.code}: ${outcome.message}`); return
+      case "rejected":
+        // A refused turn/start never ran, so retrying is side-effect free. Images must not cost the words.
+        if (media.images.length && !msg.imagesRefused) {
+          this.log({ event: "turn-images-refused", msgId: msg.msgId, images: media.images.length, code: outcome.code })
+          await this.runTurnLocked({ ...msg, images: undefined, imagesRefused: `${outcome.code}: ${outcome.message}` }, threadId)
+          return
+        }
+        await this.finishFailed(msg, "turn-start-failed", `${outcome.code}: ${outcome.message}`); return
     }
   }
 
@@ -1668,17 +1685,78 @@ function meshNodeOf(cfg: Record<string, unknown> | undefined): string | null {
 }
 
 function toIncoming(m: MeshMessage, to: string): Incoming {
+  const attached = meshAttachments(m.meta)
   return {
     msgId: m.id,
     seq: m.seq ?? 0,
     to: m.to || to,
     from: m.from,
-    payload: m.payload,
+    payload: m.payload + attached.lines,
     nonce: extractNonce(m.payload, m.id),
     createdAt: m.createdAt,
     messageType: m.type,
     replyTo: m.replyTo,
+    ...(attached.images.length ? { images: attached.images } : {}),
   }
+}
+
+const MAX_TURN_IMAGES = 16
+
+/** Channel contract: absolute, single-line paths only; anything else is refused before durable acceptance. */
+function checkedImagePaths(images: unknown): string[] | undefined {
+  if (images === undefined) return undefined
+  if (!Array.isArray(images) || images.length > MAX_TURN_IMAGES) throw new Error(`channel images must be an array of at most ${MAX_TURN_IMAGES} image paths`)
+  for (const p of images) {
+    if (typeof p !== "string" || !path.isAbsolute(p) || /[\0\r\n]/.test(p)) throw new Error("channel image path must be an absolute single-line string")
+  }
+  return images.length ? [...images] : undefined
+}
+
+function fetchedExtra(msg: Incoming): Partial<WalEntry> {
+  return { payload: msg.payload, ...(msg.images?.length ? { images: msg.images } : {}) }
+}
+
+/** Only files that still exist become native input; a vanished one (TTL cleanup) is named in the text instead. */
+function usableImages(images: string[] | undefined): { images: string[]; note: string } {
+  const ok: string[] = []
+  let note = ""
+  for (const p of images ?? []) {
+    let file = false
+    try { file = fs.statSync(p).isFile() } catch { /* gone */ }
+    if (file) ok.push(p)
+    else note += `\n[图片文件已不可用：${p}（可能已过期清理）]`
+  }
+  return { images: ok, note }
+}
+
+/**
+ * The relay's /api/sync derives `meta.attachments[].localPath|error` for this node. Render every
+ * attachment as a visible line (the inject format's `[attachment]` convention) and hand the
+ * materialized images to the model natively. Transport metadata only: never parsed from payload.
+ */
+function meshAttachments(meta: MeshMessage["meta"]): { images: string[]; lines: string } {
+  const raw = (meta as { attachments?: unknown } | undefined)?.attachments
+  if (!Array.isArray(raw) || raw.length === 0) return { images: [], lines: "" }
+  const images: string[] = []
+  const lines: string[] = []
+  raw.slice(0, MAX_TURN_IMAGES).forEach((a: any, i: number) => {
+    const n = i + 1
+    const local = a && typeof a === "object" ? a.localPath : undefined
+    if (typeof local !== "string" || !local) {
+      const error = a && typeof a.error === "string" ? shortDetail(a.error) : "not materialized"
+      lines.push(`[attachment ${n} unavailable: ${error}]`)
+      return
+    }
+    if (!path.isAbsolute(local) || /[\0\r\n]/.test(local)) { lines.push(`[attachment ${n} unavailable: invalid local path]`); return }
+    const mime = typeof a.mime === "string" ? a.mime : "application/octet-stream"
+    const dims = Number.isSafeInteger(a.width) && Number.isSafeInteger(a.height) ? ` ${a.width}x${a.height}` : ""
+    const size = Number.isSafeInteger(a.size) ? ` ${a.size}B` : ""
+    const sha = typeof a.sha256 === "string" && /^[0-9a-f]{64}$/.test(a.sha256) ? ` sha256=${a.sha256}` : ""
+    lines.push(`[attachment ${n}] ${mime}${dims}${size}${sha} ${local}`)
+    if (a.kind === "image" && mime.startsWith("image/")) images.push(local)
+  })
+  if (raw.length > MAX_TURN_IMAGES) lines.push(`[attachments truncated: ${raw.length - MAX_TURN_IMAGES} more]`)
+  return { images, lines: `\n${lines.join("\n")}` }
 }
 
 function defaultFileLogger(file: string): SeatLogger {

@@ -4,12 +4,37 @@ import path from 'node:path'
 import {createHash} from 'node:crypto'
 import type {WeixinMessage} from '@cc-mesh/wechat-transport/types'
 
+/** One downloaded (or definitively failed) attachment slot of an inbound message. */
+export interface MediaRecord {
+  message:string
+  /** Item index in item_list; a quoted item of index i is `${i}r`. */
+  slot:string
+  status:'ready'|'failed'|'retry'|'expired'
+  attempts:number
+  retryAt:number
+  createdAt:number
+  expiresAt?:number
+  sha256?:string
+  mime?:string
+  bytes?:number
+  width?:number
+  height?:number
+  file?:string
+  /** Image handed to the model as native image input. */
+  native:boolean
+  error?:string
+}
+type MediaRow={message:string;slot:string;status:MediaRecord['status'];attempts:number;retry_at:number;created_at:number;expires_at:number|null;sha256:string|null;mime:string|null;bytes:number|null;width:number|null;height:number|null;file:string|null;native:number;error:string|null}
+const fromRow=(r:MediaRow):MediaRecord=>({message:r.message,slot:r.slot,status:r.status,attempts:r.attempts,retryAt:r.retry_at,createdAt:r.created_at,native:!!r.native,
+  ...(r.expires_at!==null?{expiresAt:r.expires_at}:{}),...(r.sha256!==null?{sha256:r.sha256}:{}),...(r.mime!==null?{mime:r.mime}:{}),...(r.bytes!==null?{bytes:r.bytes}:{}),
+  ...(r.width!==null?{width:r.width}:{}),...(r.height!==null?{height:r.height}:{}),...(r.file!==null?{file:r.file}:{}),...(r.error!==null?{error:r.error}:{})})
+
 export function rawMessageId(message:WeixinMessage):string {
   return createHash('sha256').update(JSON.stringify([message.from_user_id,message.message_id ?? message.client_id ?? [message.create_time_ms,message.item_list]])).digest('hex')
 }
 export class WeChatStore {
   private db:Database.Database
-  constructor(file:string,accountId:string,ownerId:string) {
+  constructor(readonly file:string,accountId:string,ownerId:string) {
     fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700})
     this.db=new Database(file)
     const version=this.db.pragma('user_version',{simple:true})
@@ -19,7 +44,11 @@ export class WeChatStore {
     this.db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS incoming (seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,raw TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',error TEXT);
       CREATE TABLE IF NOT EXISTS routes (endpoint TEXT PRIMARY KEY,token TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS delivery (id TEXT PRIMARY KEY,text TEXT NOT NULL,next_part INTEGER NOT NULL DEFAULT 0,done INTEGER NOT NULL DEFAULT 0);`)
+      CREATE TABLE IF NOT EXISTS delivery (id TEXT PRIMARY KEY,text TEXT NOT NULL,next_part INTEGER NOT NULL DEFAULT 0,done INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS media (message TEXT NOT NULL,slot TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,expires_at INTEGER,sha256 TEXT,mime TEXT,bytes INTEGER,width INTEGER,height INTEGER,file TEXT,native INTEGER NOT NULL DEFAULT 0,error TEXT,
+        PRIMARY KEY(message,slot));`)
+    // The media table is additive: user_version stays 1 so a rollback binary still opens this store.
     this.db.pragma('user_version = 1')
     const identity=JSON.stringify([accountId,ownerId])
     const old=this.get('identity')
@@ -73,5 +102,20 @@ export class WeChatStore {
     return row
   }
   partSent(id:string,nextPart:number,done:boolean):void {this.db.prepare('UPDATE delivery SET next_part=?,done=? WHERE id=?').run(nextPart,done?1:0,id)}
-  close():void{this.db.close()}
+  mediaRecords(message:string):MediaRecord[]{return (this.db.prepare('SELECT * FROM media WHERE message=? ORDER BY slot').all(message) as MediaRow[]).map(fromRow)}
+  mediaSave(r:MediaRecord):void{
+    this.db.prepare(`INSERT INTO media(message,slot,status,attempts,retry_at,created_at,expires_at,sha256,mime,bytes,width,height,file,native,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(message,slot) DO UPDATE SET status=excluded.status,attempts=excluded.attempts,retry_at=excluded.retry_at,created_at=excluded.created_at,expires_at=excluded.expires_at,
+      sha256=excluded.sha256,mime=excluded.mime,bytes=excluded.bytes,width=excluded.width,height=excluded.height,file=excluded.file,native=excluded.native,error=excluded.error`)
+      .run(r.message,r.slot,r.status,r.attempts,r.retryAt,r.createdAt,r.expiresAt??null,r.sha256??null,r.mime??null,r.bytes??null,r.width??null,r.height??null,r.file??null,r.native?1:0,r.error??null)
+  }
+  mediaForget(message:string,slot:string):void{this.db.prepare('DELETE FROM media WHERE message=? AND slot=?').run(message,slot)}
+  mediaExpiring(now:number):MediaRecord[]{return (this.db.prepare("SELECT * FROM media WHERE status='ready' AND expires_at<=?").all(now) as MediaRow[]).map(fromRow)}
+  mediaLiveFiles(now:number):string[]{return (this.db.prepare("SELECT DISTINCT file FROM media WHERE status='ready' AND file IS NOT NULL AND expires_at>?").all(now) as Array<{file:string}>).map(r=>r.file)}
+  mediaExpire(message:string,slot:string):void{this.db.prepare("UPDATE media SET status='expired' WHERE message=? AND slot=?").run(message,slot)}
+  mediaCounts():{ready:number;failed:number}{
+    const rows=this.db.prepare("SELECT status,count(*) AS n FROM media WHERE status IN ('ready','failed') GROUP BY status").all() as Array<{status:string;n:number}>
+    return {ready:rows.find(r=>r.status==='ready')?.n??0,failed:rows.find(r=>r.status==='failed')?.n??0}
+  }
+  close():void{if(this.db.open)this.db.close()}
 }

@@ -474,7 +474,9 @@ export class RealAppServerClient implements IAppServerClient {
         at.earlyNotifications = []
         const ack = await conn.request("turn/start", {
           threadId: req.threadId,
-          input: [{ type: "text", text: req.text, text_elements: [] }],
+          // Images follow the text as native input items; the text names them in the same order.
+          input: [{ type: "text", text: req.text, text_elements: [] },
+            ...(req.images ?? []).map((path) => ({ type: "localImage", path }))],
           approvalPolicy: TURN_BYPASS.approvalPolicy,
           sandboxPolicy: TURN_BYPASS.sandboxPolicy,
         }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS, req.timeoutMs === 0
