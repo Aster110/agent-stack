@@ -85,6 +85,26 @@ describe("Hub blob HTTP", () => {
     assert.equal(files.length, 1, "内容寻址只落一份正文")
   })
 
+  it("JPEG/WebP 原字节进白名单：manifest 记真实 MIME 与尺寸，下载按同 MIME 回原字节", async () => {
+    const { base } = await start()
+    const jpeg = Buffer.concat([Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"),
+      Buffer.from([0xff, 0xc0, 0, 17, 8, 0, 3, 0, 4, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]), Buffer.from("ffd9", "hex")])
+    const webp = Buffer.alloc(30); webp.write("RIFF", 0); webp.writeUInt32LE(22, 4); webp.write("WEBPVP8X", 8); webp.writeUIntLE(4, 24, 3); webp.writeUIntLE(1, 27, 3)
+    for (const [bytes, mime, w, h] of [[jpeg, "image/jpeg", 4, 3], [webp, "image/webp", 5, 2]] as const) {
+      const up = await upload(base, bytes, mime)
+      assert.equal(up.status, 201, mime)
+      const m = (await up.json() as JsonResponse).data?.manifest
+      assert.equal(m.mime, mime)
+      assert.deepEqual([m.width, m.height, m.size], [w, h, bytes.length])
+      const got = await fetch(`${base}/api/blobs/${m.id}`, { headers: auth() })
+      assert.equal(got.status, 200)
+      assert.equal(got.headers.get("content-type"), mime)
+      assert.deepEqual(Buffer.from(await got.arrayBuffer()), bytes)
+    }
+    assert.equal((await upload(base, jpeg, "image/png")).status, 415, "声明与魔数不符")
+    assert.equal((await upload(base, Buffer.from("BM6\0\0\0\0\0\0\0"), "image/bmp")).status, 415, "白名单外")
+  })
+
   it("无/错 Bearer 均拒绝上传与下载，且 token 不进入错误正文", async () => {
     const { base } = await start()
     const noToken = await fetch(`${base}/api/blobs`, { method: "POST", headers: { "Content-Type": "image/png" }, body: PNG })

@@ -19,6 +19,9 @@ const PNG = Buffer.from(
   "base64",
 )
 const SHA = createHash("sha256").update(PNG).digest("hex")
+/** Minimal JPEG (SOI, APP0, SOF0 8x6, EOI): enough structure for magic-byte sniffing and dimensions. */
+const JPEG = Buffer.concat([Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"),
+  Buffer.from([0xff, 0xc0, 0, 17, 8, 0, 6, 0, 8, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]), Buffer.from("ffd9", "hex")])
 const FIXED_NOW = Date.parse("2026-08-28T12:00:00.000Z")
 const EXPECTED_SYNC_MAX_LIMIT = 100
 const EXPECTED_MATERIALIZE_CONCURRENCY = 4
@@ -80,10 +83,11 @@ describe("Relay attachment delivery", () => {
     const terminal = new Terminal()
     const uploadCalls: Buffer[] = []
     const uploadTtls: number[] = []
+    const uploadMimes: string[] = []
     const materializeCalls: ImageAttachmentManifest[] = []
     const attachmentManager = {
       async upload(bytes: Buffer, mime: string, ttl: number): Promise<ImageAttachmentManifest> {
-        assert.equal(mime, "image/png")
+        uploadMimes.push(mime)
         uploadCalls.push(Buffer.from(bytes))
         uploadTtls.push(ttl)
         return manifest()
@@ -106,7 +110,7 @@ describe("Relay attachment delivery", () => {
     })
     servers.push(server)
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
-    return { app, base, terminal, uploadCalls, uploadTtls, materializeCalls }
+    return { app, base, terminal, uploadCalls, uploadTtls, uploadMimes, materializeCalls }
   }
 
   async function register(base: string, shortId: string, deliveryMode: "pull" | "inject") {
@@ -142,6 +146,28 @@ describe("Relay attachment delivery", () => {
     const serialized = JSON.stringify(row)
     assert.equal(serialized.includes(PNG.toString("base64")), false)
     assert.equal(serialized.includes(PNG.toString("latin1")), false)
+  })
+
+  it("Relay 上传入口按白名单收 JPEG/WebP/GIF 原字节，声明与魔数不符或非白名单一律 415 且不碰 Hub", async () => {
+    const ts = await start()
+    const ok = await fetch(`${ts.base}/api/attachments`, {
+      method: "POST", headers: { "Content-Type": "image/jpeg" }, body: JPEG as unknown as BodyInit,
+    })
+    assert.equal(ok.status, 201)
+    assert.deepEqual(ts.uploadCalls, [JPEG], "上传给 Hub 的必须是原字节，不转码")
+    assert.deepEqual(ts.uploadMimes, ["image/jpeg"])
+    for (const c of [
+      { body: JPEG, mime: "image/png" },
+      { body: PNG, mime: "image/webp" },
+      { body: Buffer.from("BM6\0\0\0\0\0\0\0"), mime: "image/bmp" },
+      { body: Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'/>"), mime: "image/svg+xml" },
+    ]) {
+      const r = await fetch(`${ts.base}/api/attachments`, {
+        method: "POST", headers: { "Content-Type": c.mime }, body: c.body as unknown as BodyInit,
+      })
+      assert.equal(r.status, 415, c.mime)
+    }
+    assert.equal(ts.uploadCalls.length, 1)
   })
 
   it("Relay 上传入口在调用 Hub 前执行字节、PNG MIME 与 TTL 上限", async () => {
