@@ -72,7 +72,7 @@ export class FakeRelay {
    * `createdAt` 可显式指定：年龄闸（防线 2）判的就是它，测「出生前的历史消息」时必须能造老时间戳。
    * 真 relay 的 createdAt 由入库时刻决定，测试里只能自己埋。
    */
-  deliver(to: string, from: string, payload: string, type = "chat", replyTo?: string, id?: string, createdAt?: string): string {
+  deliver(to: string, from: string, payload: string, type = "chat", replyTo?: string, id?: string, createdAt?: string, meta?: Record<string, unknown>): string {
     this.seq++
     const msg: MeshMessage = {
       id: id ?? `msg-${Date.now()}-${this.seq}`,
@@ -81,6 +81,8 @@ export class FakeRelay {
       type: type as MeshMessage["type"],
       payload,
       ...(replyTo ? { replyTo } : {}),
+      // 真 relay 的 /api/sync 在响应里给 meta.attachments[] 派生 localPath|error（不回写库）。
+      ...(meta ? { meta } : {}),
       createdAt: createdAt ?? new Date().toISOString(),
       seq: this.seq,
     }

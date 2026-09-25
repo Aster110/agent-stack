@@ -310,6 +310,28 @@ describe("RealAppServerClient：thread 与 turn", () => {
     console.log(`[turn] ${Date.now() - t0}ms events=${evTypes.length}`)
   })
 
+  it("图片随同一轮 turn/start 以原生 localImage 输入送达：正文在前，图片按给定顺序跟在后面", async () => {
+    const r = rig("turn-images", { turn: OK_TURN })
+    const c = client(r)
+    await c.start()
+    const th = await c.threadStart({ cwd: r.cwd })
+    const first = path.join(r.dir, "first.jpg")
+    const second = path.join(r.dir, "second.png")
+    const h = await c.turnStart({ threadId: th.threadId, text: "看图 [图片1] [图片2]", images: [first, second], nonce: "n-img", msgId: "m-img", timeoutMs: 8000 })
+    assert.equal((await h.done).status, "completed")
+    const input = received(r, "turn/start")[0].params.input
+    assert.deepEqual(input, [
+      { type: "text", text: "看图 [图片1] [图片2]", text_elements: [] },
+      { type: "localImage", path: first },
+      { type: "localImage", path: second },
+    ])
+    // 没有图片时报文形状与旧版逐字节一致：不出现空的附加项。
+    const plain = await c.turnStart({ threadId: th.threadId, text: "纯文字", nonce: "n-plain", msgId: "m-plain", timeoutMs: 8000 })
+    assert.equal((await plain.done).status, "completed")
+    assert.deepEqual(received(r, "turn/start")[1].params.input, [{ type: "text", text: "纯文字", text_elements: [] }])
+    await c.stop()
+  })
+
   it("turn/start 被拒（-32600）→ done = rejected，不是抛异常", async () => {
     const r = rig("turn-reject", { turn: OK_TURN, failTurnStart: { code: -32600, message: "missing field `type`" } })
     const c = client(r)
