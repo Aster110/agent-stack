@@ -13,6 +13,8 @@ import {
   MAX_IMAGE_TTL_SECONDS,
   validateImageAttachmentManifest,
   validateImageAttachmentManifests,
+  IMAGE_ATTACHMENT_MIMES,
+  sniffImageAttachment,
 } from "./attachments.js"
 
 const SHA = "a".repeat(64)
@@ -74,13 +76,35 @@ describe("ImageAttachmentManifest", () => {
       manifest({ expiresAt: new Date(NOW + (MAX_IMAGE_TTL_SECONDS + 1) * 1_000).toISOString() }),
       manifest({ size: MAX_IMAGE_BYTES + 1 }),
       manifest({ mime: "image/svg+xml" as "image/png" }),
-      manifest({ mime: "image/jpeg" as "image/png" }),
-      manifest({ mime: "image/gif" as "image/png" }),
-      manifest({ mime: "image/webp" as "image/png" }),
+      manifest({ mime: "image/bmp" as "image/png" }),
+      manifest({ mime: "image/heic" as "image/png" }),
+      manifest({ mime: "text/plain" as "image/png" }),
       manifest({ width: 100_000, height: 100_000 }),
     ]
     for (const value of bad) {
       assert.throws(() => validateImageAttachmentManifest(value, { nowMs: NOW }))
+    }
+  })
+
+  it("JPEG/WebP/GIF 与 PNG 同属白名单：原字节原 MIME 的 manifest 通过", () => {
+    for (const mime of ["image/png", "image/jpeg", "image/webp", "image/gif"] as const) {
+      assert.equal(validateImageAttachmentManifest(manifest({ mime }), { nowMs: NOW }).mime, mime)
+    }
+    assert.deepEqual([...IMAGE_ATTACHMENT_MIMES].sort(), ["image/gif", "image/jpeg", "image/png", "image/webp"])
+  })
+
+  it("sniffImageAttachment 只凭魔数认出四种格式与尺寸，伪装与截断一律 null", () => {
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64")
+    const jpeg = Buffer.concat([Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"),
+      Buffer.from([0xff, 0xc0, 0, 17, 8, 0x04, 0xff, 0x06, 0xaa, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]), Buffer.from("ffd9", "hex")])
+    const gif = Buffer.concat([Buffer.from("GIF89a"), Buffer.from([3, 0, 2, 0]), Buffer.alloc(3)])
+    const webp = Buffer.alloc(30); webp.write("RIFF", 0); webp.writeUInt32LE(22, 4); webp.write("WEBPVP8X", 8); webp.writeUIntLE(3999, 24, 3); webp.writeUIntLE(2999, 27, 3)
+    assert.deepEqual(sniffImageAttachment(png), { mime: "image/png", width: 1, height: 1 })
+    assert.deepEqual(sniffImageAttachment(jpeg), { mime: "image/jpeg", width: 1706, height: 1279 })
+    assert.deepEqual(sniffImageAttachment(gif), { mime: "image/gif", width: 3, height: 2 })
+    assert.deepEqual(sniffImageAttachment(webp), { mime: "image/webp", width: 4000, height: 3000 })
+    for (const bad of [Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'/>"), Buffer.from("BM6\0\0\0"), jpeg.subarray(0, 12), Buffer.alloc(0)]) {
+      assert.equal(sniffImageAttachment(bad), null)
     }
   })
 

@@ -430,7 +430,7 @@ usage() {
   status                    查看在线节点
 
 消息:
-  send <to> <message> [--image <png>]  发送正文，可附最多 4 张 PNG
+  send <to> <message> [--image <file>]  发送正文，可附最多 4 张图片（PNG/JPEG/WebP/GIF，原字节传输）
   inbox                     查看收件箱
   broadcast <message>       广播消息
   devices                   查看 Hub 同步过来的设备列表
@@ -478,6 +478,20 @@ Skill:
 EOF
 }
 
+# 图片类型只看魔数（不信扩展名）；白名单外返回非零。原字节上传，不转码。
+image_mime() {
+  python3 - "$1" <<'PY'
+import sys
+with open(sys.argv[1], "rb") as f:
+    b = f.read(16)
+if b.startswith(b"\x89PNG\r\n\x1a\n"): print("image/png")
+elif b.startswith(b"\xff\xd8\xff"): print("image/jpeg")
+elif b[:4] == b"RIFF" and b[8:12] == b"WEBP": print("image/webp")
+elif b[:6] in (b"GIF87a", b"GIF89a"): print("image/gif")
+else: sys.exit(1)
+PY
+}
+
 cmd_send() {
   local to="${1:?用法: mesh send <to> <message>}"
   shift
@@ -508,9 +522,13 @@ cmd_send() {
     exit 1
   fi
   local image
+  local -a mimes=()
   if (( image_count > 0 )); then
     for image in "${images[@]}"; do
       [[ -f "$image" && -r "$image" ]] || { echo "错误: 图片文件不存在或不可读" >&2; exit 1; }
+      local mime
+      mime="$(image_mime "$image")" || { echo "错误: 只支持 PNG/JPEG/WebP/GIF 图片（按文件内容判断）" >&2; exit 1; }
+      mimes+=("$mime")
     done
   fi
 
@@ -518,8 +536,10 @@ cmd_send() {
   local manifest_count=0
   local response manifest
   if (( image_count > 0 )); then
-    for image in "${images[@]}"; do
-      if response=$("${CURL[@]}" -H "Content-Type: image/png" -X POST "$RELAY/attachments" --data-binary "@$image" 2>/dev/null) \
+    local i
+    for i in "${!images[@]}"; do
+      image="${images[$i]}"
+      if response=$("${CURL[@]}" -H "Content-Type: ${mimes[$i]}" -X POST "$RELAY/attachments" --data-binary "@$image" 2>/dev/null) \
         && manifest=$(printf '%s' "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d["data"]["manifest"],separators=(",",":")))' 2>/dev/null); then
         manifests+=("$manifest")
         manifest_count=$((manifest_count + 1))

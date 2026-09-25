@@ -4,7 +4,8 @@ import { createHash } from "node:crypto"
 import type http from "node:http"
 import type { ImageAttachmentManifest } from "@cc-mesh/protocol"
 import {
-  DEFAULT_IMAGE_TTL_SECONDS, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGE_TTL_SECONDS,
+  DEFAULT_IMAGE_TTL_SECONDS, IMAGE_ATTACHMENT_MIMES, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGE_TTL_SECONDS,
+  isImageAttachmentMime, sniffImageAttachment,
 } from "@cc-mesh/protocol"
 
 export interface HubAttachmentOptions {
@@ -33,17 +34,16 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(text)
 }
 
-function pngDimensions(bytes: Buffer, maxPixels: number): { width: number; height: number } {
-  const magic = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
-  if (bytes.length < 24 || !bytes.subarray(0, 8).equals(magic) || bytes.toString("ascii", 12, 16) !== "IHDR") {
-    throw Object.assign(new Error("invalid PNG signature"), { status: 415 })
+/** The stored bytes are served unchanged, so the declared type must match the magic bytes. */
+function imageDimensions(bytes: Buffer, declared: string, maxPixels: number): { width: number; height: number } {
+  const sniffed = sniffImageAttachment(bytes)
+  if (!sniffed || sniffed.mime !== declared) {
+    throw Object.assign(new Error("image bytes do not match the declared type"), { status: 415 })
   }
-  const width = bytes.readUInt32BE(16)
-  const height = bytes.readUInt32BE(20)
-  if (width <= 0 || height <= 0 || width * height > maxPixels) {
+  if (sniffed.width * sniffed.height > maxPixels) {
     throw Object.assign(new Error("image pixel limit exceeded"), { status: 422 })
   }
-  return { width, height }
+  return { width: sniffed.width, height: sniffed.height }
 }
 
 function readRaw(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
@@ -139,8 +139,9 @@ export class BlobStore {
       if (Number.isFinite(declared) && declared > this.maxBytes) {
         json(res, 413, { ok: false, error: "attachment too large" }); return true
       }
-      if ((req.headers["content-type"] ?? "").split(";", 1)[0]?.trim().toLowerCase() !== "image/png") {
-        json(res, 415, { ok: false, error: "only image/png is supported" }); return true
+      const mime = (req.headers["content-type"] ?? "").split(";", 1)[0]?.trim().toLowerCase()
+      if (!isImageAttachmentMime(mime)) {
+        json(res, 415, { ok: false, error: `unsupported image type; allowed: ${IMAGE_ATTACHMENT_MIMES.join(", ")}` }); return true
       }
       const rawTtl = req.headers["x-attachment-ttl"]
       const ttl = rawTtl == null || rawTtl === "" ? this.defaultTtlSeconds : Number(rawTtl)
@@ -149,7 +150,7 @@ export class BlobStore {
       }
       try {
         const bytes = await readRaw(req, this.maxBytes)
-        const { width, height } = pngDimensions(bytes, this.maxPixels)
+        const { width, height } = imageDimensions(bytes, mime, this.maxPixels)
         const sha = createHash("sha256").update(bytes).digest("hex")
         const p = this.paths(sha)
         this.sweepExpired()
@@ -162,7 +163,7 @@ export class BlobStore {
         }
         const createdMs = this.now()
         const manifest: ImageAttachmentManifest = {
-          version: 1, id: `att-${sha}`, kind: "image", mime: "image/png", size: bytes.length,
+          version: 1, id: `att-${sha}`, kind: "image", mime, size: bytes.length,
           sha256: sha, width, height, storageRef: `hub-blob:${sha}`,
           createdAt: new Date(createdMs).toISOString(), expiresAt: new Date(createdMs + ttl * 1000).toISOString(),
         }
@@ -212,7 +213,7 @@ export class BlobStore {
     }
     const body = bytes.subarray(start, end + 1)
     res.writeHead(status, {
-      "content-type": "image/png", "content-length": String(body.length), "accept-ranges": "bytes",
+      "content-type": manifest.mime, "content-length": String(body.length), "accept-ranges": "bytes",
       ...(status === 206 ? { "content-range": `bytes ${start}-${end}/${bytes.length}` } : {}),
       "cache-control": "private, no-store",
     })

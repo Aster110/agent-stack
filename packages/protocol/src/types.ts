@@ -74,12 +74,15 @@ export interface MeshMessage {
   meta?: Record<string, unknown>  // 结构化元数据（如派单 _task 信封）。只进库/上账本，注入终端时不带——正文永远只有 payload
 }
 
-/** PNG-only attachment manifest. Blob bytes and credentials never travel here. */
+/** Whitelisted image types; bytes travel unchanged, so the manifest names the real type. */
+export type ImageAttachmentMime = "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+
+/** Image attachment manifest (PNG/JPEG/WebP/GIF). Blob bytes and credentials never travel here. */
 export interface ImageAttachmentManifest {
   version: 1
   id: string
   kind: "image"
-  mime: "image/png"
+  mime: ImageAttachmentMime
   size: number
   sha256: string
   width?: number

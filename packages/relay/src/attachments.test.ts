@@ -17,6 +17,12 @@ const PNG = Buffer.from(
 )
 const SHA = createHash("sha256").update(PNG).digest("hex")
 const NOW = Date.parse("2026-08-28T12:00:00.000Z")
+const JPEG = Buffer.concat([Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"),
+  Buffer.from([0xff, 0xc0, 0, 17, 8, 0, 6, 0, 8, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]), Buffer.from("ffd9", "hex")])
+const JPEG_SHA = createHash("sha256").update(JPEG).digest("hex")
+function jpegManifest(): ImageAttachmentManifest {
+  return manifest({ id: `att-${JPEG_SHA}`, mime: "image/jpeg", size: JPEG.length, sha256: JPEG_SHA, width: 8, height: 6, storageRef: `hub-blob:${JPEG_SHA}` })
+}
 
 function manifest(over: Partial<ImageAttachmentManifest> = {}): ImageAttachmentManifest {
   return {
@@ -91,6 +97,27 @@ describe("AttachmentManager", () => {
     assert.equal(fs.realpathSync(got.localPath!).startsWith(fs.realpathSync(root) + path.sep), true)
     assert.deepEqual(fs.readFileSync(got.localPath!), PNG)
     assert.equal(fs.readdirSync(root).some((x) => x.endsWith(".part")), false)
+  })
+
+  it("JPEG 原字节按声明 MIME 物化为 .jpg，字节与 SHA 与原图一致；MIME 或魔数不符判完整性失败", async () => {
+    const ok = manager((async (): Promise<Response> => new Response(JPEG, {
+      status: 200, headers: { "Content-Type": "image/jpeg", "Content-Length": String(JPEG.length) },
+    })) as typeof fetch)
+    const got = await ok.manager.materialize(jpegManifest())
+    assert.equal(got.error, undefined)
+    assert.match(got.localPath!, /att-[a-f0-9]{64}\.jpg$/)
+    assert.deepEqual(fs.readFileSync(got.localPath!), JPEG)
+    assert.equal(createHash("sha256").update(fs.readFileSync(got.localPath!)).digest("hex"), JPEG_SHA)
+    assert.equal(ok.manager.sweepExpired(NOW + 120_000), 1, "TTL 清理同样覆盖 .jpg 缓存")
+    assert.equal(fs.existsSync(got.localPath!), false)
+    for (const [bytes, type] of [[JPEG, "image/png"], [PNG, "image/jpeg"]] as const) {
+      const bad = manager((async (): Promise<Response> => new Response(bytes, {
+        status: 200, headers: { "Content-Type": type, "Content-Length": String(bytes.length) },
+      })) as typeof fetch, { maxRetries: 0 })
+      const res = await bad.manager.materialize(jpegManifest())
+      assert.equal(res.localPath, undefined)
+      assert.equal(res.error, "integrity")
+    }
   })
 
   it("篡改/截断下载不暴露 localPath，并清理 .part", async () => {

@@ -5,6 +5,7 @@
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
+import { createHash } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
 import type { Server } from "node:http"
@@ -216,6 +217,88 @@ describe("image attachment two-relay E2E", () => {
       try { senderApp?.store.close() } catch { /* already closed */ }
       try { receiverApp?.store.close() } catch { /* already closed */ }
       if (hub) await hub.close()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+/** Real Hub (WS + Blob HTTP) and two real Relays, as in the PNG case above; only the image type differs. */
+async function twoRelays(root: string) {
+  const hub = await createHub({
+    port: 0, auth: new TokenAuth(TOKEN),
+    ledger: { dbPath: path.join(root, "ledger.db"), token: TOKEN, httpPort: 0, quiet: true },
+    attachments: { rootDir: path.join(root, "hub-blobs"), maxBytes: 4096, quotaBytes: 65536, maxPixels: 10_000, defaultTtlSeconds: 60 },
+  })
+  const hubHttpBase = `http://127.0.0.1:${hub.attachments!.httpPort}`
+  const hubUrl = `ws://127.0.0.1:${hub.port}`
+  const side = async (deviceId: string) => {
+    let ref: MeshServer
+    const uplink = new WebSocketUplink({
+      hubUrl, token: TOKEN, reconnectMs: 20, ackTimeoutMs: 1_000,
+      getRegistration: () => ({ relayId: `relay-${deviceId}`, deviceId, connectedAt: new Date().toISOString(), nodes: ref.registry.getAll().map((n) => n.identity) }),
+    })
+    const cache = path.join(root, `${deviceId}-cache`)
+    const app = ref = createServer({
+      dbPath: path.join(root, `${deviceId}.db`), deviceId, terminal: new NoopTerminal(),
+      transport: new CompositeTransport(new NoopTerminal(), uplink, { deviceId }), uplink, events: new MeshEventBus(),
+      attachmentManager: new AttachmentManager({ hubHttpBase, token: TOKEN, cacheDir: cache, fetchImpl: fetch, maxRetries: 1 }),
+      commandRunner: async (file: string) => { throw new Error(`E2E forbids external command execution: ${file}`) },
+    } as any)
+    wireRelayUplink({ app, uplink })
+    await uplink.connect()
+    const http = await listen(app)
+    const r = await fetch(`${base(http)}/api/register`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ shortId: `cc-${deviceId}`, pid: 123, role: "worker", description: "e2e", deliveryMode: "pull" }),
+    })
+    const nodeId = (await r.json() as any).data.nodeId as string
+    return { app, uplink, http, cache, nodeId, origin: base(http) }
+  }
+  const sender = await side("computer2")
+  const receiver = await side("mini")
+  await waitFor(() => hub.getNodeLocation(sender.nodeId) === "relay-computer2" && hub.getNodeLocation(receiver.nodeId) === "relay-mini", "Hub 未登记两端 Relay")
+  const close = async () => {
+    await Promise.all([closeServer(sender.http), closeServer(receiver.http)])
+    await Promise.all([sender.uplink.disconnect(), receiver.uplink.disconnect()])
+    for (const app of [sender.app, receiver.app]) { try { app.store.close() } catch { /* closed */ } }
+    await hub.close()
+  }
+  return { hub, sender, receiver, close }
+}
+
+describe("image attachment two-relay E2E: whitelisted formats keep their original bytes", () => {
+  it("JPEG 与 WebP 经真实 Hub/双 Relay 转发：接收端字节与 SHA-256 和原图一致，扩展名随真实类型", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccmesh-image-e2e-jpeg-"))
+    const net = await twoRelays(root)
+    try {
+      const jpeg = Buffer.concat([Buffer.from("ffd8ffe000104a46494600010100000100010000", "hex"),
+        Buffer.from([0xff, 0xc0, 0, 17, 8, 0, 30, 0, 40, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]), Buffer.from("0102030405060708", "hex"), Buffer.from("ffd9", "hex")])
+      const webp = Buffer.alloc(40); webp.write("RIFF", 0); webp.writeUInt32LE(32, 4); webp.write("WEBPVP8X", 8); webp.writeUIntLE(63, 24, 3); webp.writeUIntLE(31, 27, 3)
+      let since = 0
+      for (const [bytes, mime, ext] of [[jpeg, "image/jpeg", "jpg"], [webp, "image/webp", "webp"]] as const) {
+        const up = await fetch(`${net.sender.origin}/api/attachments`, { method: "POST", headers: { "Content-Type": mime }, body: bytes as unknown as BodyInit })
+        assert.equal(up.status, 201, mime)
+        const manifest = (await up.json() as any).data.manifest
+        assert.equal(manifest.mime, mime)
+        const sent = await fetch(`${net.sender.origin}/api/send`, {
+          method: "POST", headers: { "Content-Type": "application/json", "X-Mesh-Node": net.sender.nodeId },
+          body: JSON.stringify({ to: net.receiver.nodeId, message: `original ${ext}`, attachments: [manifest] }),
+        })
+        assert.equal(sent.status, 200)
+        await waitFor(() => net.receiver.app.store.getInbox(net.receiver.nodeId).length > (ext === "jpg" ? 0 : 1), `${ext} 未跨 Relay 到达`)
+        const doc = await (await fetch(`${net.receiver.origin}/api/sync?nodeId=${encodeURIComponent(net.receiver.nodeId)}&since=${since}&timeout=0`)).json() as any
+        since = doc.data.nextSince
+        const delivered = doc.data.messages.at(-1).meta.attachments[0]
+        assert.equal(delivered.error, undefined)
+        assert.equal(delivered.mime, mime)
+        assert.ok(delivered.localPath.endsWith(`.${ext}`))
+        assert.equal(fs.realpathSync(delivered.localPath).startsWith(fs.realpathSync(net.receiver.cache) + path.sep), true)
+        const received = fs.readFileSync(delivered.localPath)
+        assert.deepEqual(received, bytes, "接收端逐字节等于原图")
+        assert.equal(createHash("sha256").update(received).digest("hex"), manifest.sha256)
+      }
+    } finally {
+      await net.close()
       fs.rmSync(root, { recursive: true, force: true })
     }
   })

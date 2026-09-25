@@ -2,7 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { createHash } from "node:crypto"
 import type { ImageAttachmentManifest, MeshMessage } from "@cc-mesh/protocol"
-import { validateImageAttachmentManifest } from "@cc-mesh/protocol"
+import { IMAGE_ATTACHMENT_EXT, sniffImageAttachment, validateImageAttachmentManifest } from "@cc-mesh/protocol"
 
 export interface AttachmentManagerOptions {
   hubHttpBase: string
@@ -42,10 +42,6 @@ export async function formatAttachmentsForDelivery(
     }
   }
   return `${text}\n${lines.join("\n")}`
-}
-
-function isPng(bytes: Buffer): boolean {
-  return bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
 }
 
 export class AttachmentManager {
@@ -116,7 +112,7 @@ export class AttachmentManager {
   }
 
   private cachePaths(manifest: ImageAttachmentManifest): { final: string; part: string; meta: string } {
-    const name = `${manifest.id}.png`
+    const name = `${manifest.id}.${IMAGE_ATTACHMENT_EXT[manifest.mime]}`
     const final = path.join(this.cacheDir, name)
     const part = `${final}.part`
     const meta = `${final}.json`
@@ -171,7 +167,7 @@ export class AttachmentManager {
           if (offset === 0 && response.status !== 200) throw new Error(`unexpected status ${response.status}`)
           if (offset > 0 && response.status !== 206) throw Object.assign(new Error("invalid range status"), { integrity: true })
           const mime = (response.headers.get("content-type") ?? "").split(";", 1)[0]?.trim().toLowerCase()
-          if (mime !== "image/png") throw Object.assign(new Error("mime integrity failure"), { integrity: true })
+          if (mime !== manifest.mime) throw Object.assign(new Error("mime integrity failure"), { integrity: true })
           if (offset > 0) {
             const parsed = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get("content-range") ?? "")
             if (!parsed
@@ -212,14 +208,14 @@ export class AttachmentManager {
 
   private verify(bytes: Buffer, manifest: ImageAttachmentManifest): boolean {
     return bytes.length === manifest.size
-      && isPng(bytes)
+      && sniffImageAttachment(bytes)?.mime === manifest.mime
       && createHash("sha256").update(bytes).digest("hex") === manifest.sha256
   }
 
   sweepExpired(nowMs = this.now()): number {
     let removed = 0
     for (const name of fs.readdirSync(this.cacheDir)) {
-      if (!/^att-[a-f0-9]{64}\.png\.json$/.test(name)) continue
+      if (!/^att-[a-f0-9]{64}\.(png|jpg|webp|gif)\.json$/.test(name)) continue
       const meta = path.join(this.cacheDir, name)
       let expired = true
       try { expired = Date.parse(JSON.parse(fs.readFileSync(meta, "utf8")).expiresAt) <= nowMs } catch { /* corrupt = remove */ }

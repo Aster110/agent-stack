@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mesh send --image 红测：PNG-only；raw 上传；精确 JSON；失败保正文且不泄路径。
+# mesh send --image 红测：PNG/JPEG/WebP/GIF 白名单按魔数定 Content-Type；raw 上传；精确 JSON；失败保正文且不泄路径。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,6 +11,10 @@ WECHAT_CALLS="$TMP_DIR/wechat.log"
 PNG="$TMP_DIR/private test image.png"
 
 python3 -c 'import base64,sys; open(sys.argv[1],"wb").write(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))' "$PNG"
+JPEG="$TMP_DIR/wechat photo.png"   # 扩展名故意写错：类型只看魔数
+python3 -c 'import sys; open(sys.argv[1],"wb").write(bytes.fromhex("ffd8ffe000104a46494600010100000100010000ffc000110800060008030122000211010311 01ffd9".replace(" ","")))' "$JPEG"
+NOTIMG="$TMP_DIR/notes.jpg"
+printf 'plain text pretending to be an image\n' > "$NOTIMG"
 
 cat > "$TMP_DIR/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -82,6 +86,32 @@ wire=calls[1]["data"]
 assert sys.argv[2] not in wire and "iVBOR" not in wire,wire
 PY
 echo "✓ 单图 raw 上传 + 精确 send JSON"
+
+# JPEG：Content-Type 由魔数决定（不信扩展名），上传仍是原文件字节。
+: > "$CALLS"
+run_mesh send "computer2:cc-target" "原图 JPEG" --image "$JPEG" >/dev/null
+python3 - "$CALLS" "$JPEG" <<'PY'
+import json,sys
+calls=[json.loads(x) for x in open(sys.argv[1],encoding="utf-8")]
+assert len(calls)==2,calls
+up=calls[0]
+assert up["url"]=="http://relay.test/api/attachments",up
+assert "Content-Type: image/jpeg" in up["args"],up["args"]
+assert up["binary"] in ("@"+sys.argv[2],sys.argv[2]),up
+PY
+echo "✓ JPEG 按魔数上传原字节"
+
+# 非白名单文件：网络前拒绝，报清楚支持的类型，不泄路径。
+: > "$CALLS"
+set +e
+run_mesh send "computer2:cc-target" "caption" --image "$NOTIMG" >/dev/null 2>"$TMP_DIR/err"
+STATUS=$?
+set -e
+test "$STATUS" -ne 0 || { echo "FAIL: 非图片应非零退出"; exit 1; }
+test ! -s "$CALLS" || { echo "FAIL: 非图片不应请求网络"; cat "$CALLS"; exit 1; }
+grep -q "PNG/JPEG/WebP/GIF" "$TMP_DIR/err" || { echo "FAIL: 未说明支持的类型"; cat "$TMP_DIR/err"; exit 1; }
+grep -Fq "$NOTIMG" "$TMP_DIR/err" && { echo "FAIL: 错误信息泄漏本地路径"; cat "$TMP_DIR/err"; exit 1; }
+echo "✓ 非白名单类型网络前拒绝"
 
 # 多图：每图各自上传，send 只发 manifest 数组；超过 4 张本地 fail-fast。
 : > "$CALLS"

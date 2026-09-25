@@ -13,6 +13,7 @@ import type { ITransport, DeliveryTarget, DeliveryResult } from "./transport/int
 import {
   parseNodeId, genNodeId, genShortId, genMessageId, now, normalizeDeliveryMode, LEDGER_SINK,
   MAX_IMAGE_BYTES, MAX_IMAGE_TTL_SECONDS, DEFAULT_IMAGE_TTL_SECONDS, MAX_IMAGE_PIXELS,
+  IMAGE_ATTACHMENT_MIMES, isImageAttachmentMime, sniffImageAttachment,
   validateImageAttachmentManifests,
 } from "@cc-mesh/protocol"
 import { deliverToLocalNode, formatDelivery } from "./delivery/inject-pump.js"
@@ -284,8 +285,8 @@ export function createServer(opts: ServerOptions): MeshServer {
       return
     }
     const mime = (req.headers["content-type"] ?? "").split(";", 1)[0]?.trim().toLowerCase()
-    if (mime !== "image/png") {
-      res.status(415).json({ ok: false, error: "only image/png is supported" })
+    if (!isImageAttachmentMime(mime)) {
+      res.status(415).json({ ok: false, error: `unsupported image type; allowed: ${IMAGE_ATTACHMENT_MIMES.join(", ")}` })
       return
     }
     const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0)
@@ -293,14 +294,14 @@ export function createServer(opts: ServerOptions): MeshServer {
       res.status(413).json({ ok: false, error: "attachment too large" })
       return
     }
-    const pngMagic = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
-    if (body.length < 24 || !body.subarray(0, 8).equals(pngMagic) || body.toString("ascii", 12, 16) !== "IHDR") {
-      res.status(415).json({ ok: false, error: "invalid PNG" })
+    // Bytes are forwarded unchanged, so the declared type must be what the magic bytes say.
+    const sniffed = sniffImageAttachment(body)
+    if (!sniffed || sniffed.mime !== mime) {
+      res.status(415).json({ ok: false, error: "image bytes do not match the declared type" })
       return
     }
-    const width = body.readUInt32BE(16)
-    const height = body.readUInt32BE(20)
-    if (width <= 0 || height <= 0 || width * height > attachmentMaxPixels) {
+    const { width, height } = sniffed
+    if (width * height > attachmentMaxPixels) {
       res.status(422).json({ ok: false, error: "image pixel limit exceeded" })
       return
     }

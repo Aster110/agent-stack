@@ -1,4 +1,60 @@
-import type { ImageAttachmentManifest } from "./types.js"
+import type { ImageAttachmentManifest, ImageAttachmentMime } from "./types.js"
+
+/** Image types carried byte-for-byte (never transcoded). Anything else is refused at every hop. */
+export const IMAGE_ATTACHMENT_MIMES: readonly ImageAttachmentMime[] = ["image/png", "image/jpeg", "image/webp", "image/gif"]
+/** Cache/file extension per whitelisted type. */
+export const IMAGE_ATTACHMENT_EXT: Readonly<Record<ImageAttachmentMime, string>> = {
+  "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif",
+}
+
+export function isImageAttachmentMime(value: unknown): value is ImageAttachmentMime {
+  return typeof value === "string" && (IMAGE_ATTACHMENT_MIMES as readonly string[]).includes(value)
+}
+
+/**
+ * The real type and dimensions of an image from its magic bytes (PNG, JPEG, WebP, GIF); null for
+ * anything else, including truncated headers. Declared Content-Type and file names are never trusted.
+ */
+export function sniffImageAttachment(b: Uint8Array): { mime: ImageAttachmentMime; width: number; height: number } | null {
+  const buf = Buffer.from(b.buffer, b.byteOffset, b.byteLength)
+  const out = (mime: ImageAttachmentMime, width: number, height: number) => width > 0 && height > 0 ? { mime, width, height } : null
+  if (buf.length >= 24 && buf.readUInt32BE(0) === 0x89504e47 && buf.readUInt32BE(4) === 0x0d0a1a0a && buf.toString("latin1", 12, 16) === "IHDR") {
+    return out("image/png", buf.readUInt32BE(16), buf.readUInt32BE(20))
+  }
+  if (buf.length >= 10 && (buf.toString("latin1", 0, 6) === "GIF87a" || buf.toString("latin1", 0, 6) === "GIF89a")) {
+    return out("image/gif", buf.readUInt16LE(6), buf.readUInt16LE(8))
+  }
+  if (buf.length >= 16 && buf.toString("latin1", 0, 4) === "RIFF" && buf.toString("latin1", 8, 12) === "WEBP") {
+    const chunk = buf.toString("latin1", 12, 16)
+    if (chunk === "VP8X" && buf.length >= 30) return out("image/webp", buf.readUIntLE(24, 3) + 1, buf.readUIntLE(27, 3) + 1)
+    if (chunk === "VP8 " && buf.length >= 30 && buf[23] === 0x9d && buf[24] === 0x01 && buf[25] === 0x2a) {
+      return out("image/webp", buf.readUInt16LE(26) & 0x3fff, buf.readUInt16LE(28) & 0x3fff)
+    }
+    if (chunk === "VP8L" && buf.length >= 25 && buf[20] === 0x2f) {
+      const bits = buf.readUInt32LE(21)
+      return out("image/webp", (bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1)
+    }
+    return null
+  }
+  if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    let i = 2
+    while (i + 3 < buf.length) {
+      if (buf[i] !== 0xff) { i++; continue }
+      const marker = buf[i + 1]!
+      if (marker === 0xff) { i++; continue }
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue }
+      if (marker === 0xd9 || marker === 0xda) return null
+      const len = buf.readUInt16BE(i + 2)
+      if (len < 2) return null
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        if (i + 9 > buf.length) return null
+        return out("image/jpeg", buf.readUInt16BE(i + 7), buf.readUInt16BE(i + 5))
+      }
+      i += 2 + len
+    }
+  }
+  return null
+}
 
 export const MAX_ATTACHMENTS_PER_MESSAGE = 4
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -48,7 +104,7 @@ export function validateImageAttachmentManifest(
   }
   for (const key of REQUIRED) if (!Object.hasOwn(value, key)) throw new Error(`missing attachment field: ${key}`)
 
-  if (value.version !== 1 || value.kind !== "image" || value.mime !== "image/png") {
+  if (value.version !== 1 || value.kind !== "image" || !isImageAttachmentMime(value.mime)) {
     throw new Error("unsupported attachment version, kind, or mime")
   }
   if (typeof value.sha256 !== "string" || !SHA_RE.test(value.sha256)) throw new Error("invalid sha256")
