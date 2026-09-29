@@ -35,3 +35,10 @@ If any invariant fails, restore only the affected relay code/script artifacts;
 never restore a stale DB or replace the runtime/profile to work around it.
 
 The shared-token/plaintext network risks remain outside this producer patch.
+# Actual quota copy verification follow-up
+
+The s1 cron calls `/root/cc-mesh-relay/quota-probe/report-quota.sh`, not the repository path. The authorized installation copies this repository script to that exact runtime path, retaining a separate old-script backup. Its installed SHA256 is `f36e82431ca56be1af6e55fc4bc177a3dda6dcac306a522a47f7551c8d99a6a4`.
+
+The isolated contract now includes explicit `--from ''` as well as missing, legacy-short and valid complete sender arguments (12 producer cases). Test-only `MESH_TEST_PRODUCER_ROOT` and `MESH_TEST_DEVICE` allow the byte-identical actual runtime script to run against a random-loopback relay configured as `s1`, fake credentials and synthetic quota input. Missing/empty/legacy-short resolves to `s1:relay`; explicit `s1:quota-seat` is preserved. This does not claim device binding: the old shared-token Hub/relay still accepts arbitrary complete foreign authors. Preventing that is the separate Hub authentication migration, not a producer-normalization guarantee.
+
+An isolated/manual pass does not prove the real cron cycle. Keep the unchanged `*/30` schedule and separately read back the next ordinary cycle's complete sender and canonical quota entry before closing that rollout gate. Do not restart the agent runtime to obtain it.

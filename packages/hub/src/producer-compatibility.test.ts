@@ -16,16 +16,16 @@ import { WebSocketUplink } from '@cc-mesh/relay/dist/uplink/websocket.js'
 import { CompositeTransport } from '@cc-mesh/relay/dist/transport/composite.js'
 
 const run = promisify(execFile), pause = (ms = 50) => new Promise(resolve => setTimeout(resolve, ms))
-const root = path.resolve(__dirname, '../../..')
+const root = process.env.MESH_TEST_PRODUCER_ROOT ?? path.resolve(__dirname, '../../..')
 const terminal = { inject: async () => true, spawn: async () => ({ sessionId: 'fixture' }),
   isAlive: async () => true, close: async () => {}, getCurrentSession: async () => null }
 const cases = ['send', 'send-empty', 'dispatch', 'dispatch-empty', 'broadcast', 'broadcast-empty',
-  'quota-default', 'quota-short', 'quota-full', 'wake', 'transport'] as const
+  'quota-default', 'quota-empty', 'quota-short', 'quota-full', 'wake', 'transport'] as const
 
 for (const producer of cases) test(`producer compatibility: ${producer} keeps a complete local author on the existing Hub`, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'producer-contract-'))
   const hub = await createHub({ host: '127.0.0.1', port: 0, auth: new TokenAuth('fixture-shared'), ledger: { dbPath: ':memory:', quiet: true } })
-  const deviceId = 'fixture-device', sender = producer === 'quota-full' ? `${deviceId}:quota-seat` : `${deviceId}:relay`
+  const deviceId = process.env.MESH_TEST_DEVICE ?? 'fixture-device', sender = producer === 'quota-full' ? `${deviceId}:quota-seat` : `${deviceId}:relay`
   const registration = (device: string) => ({ deviceId: device, relayId: `${device}-1`, connectedAt: new Date().toISOString(),
     nodes: [{ nodeId: `${device}:main`, deviceId: device, shortId: 'main', role: 'main' as const, description: '', capabilities: [] }] })
   const peer = new WebSocket(`ws://127.0.0.1:${hub.port}`)
@@ -50,7 +50,7 @@ for (const producer of cases) test(`producer compatibility: ${producer} keeps a 
     else if (producer.startsWith('broadcast')) await post('broadcast', { message: producer }, producer.endsWith('empty'))
     else if (producer.startsWith('quota')) {
       const input = path.join(dir, 'probe.json'); fs.writeFileSync(input, JSON.stringify({ schema_version: '1', source: 'claude', host: 'not-the-device', account_id: 'fixture-account', probed_at: new Date().toISOString(), status: 'unavailable', plan_type: null, limits: [] }))
-      const from = producer === 'quota-short' ? ['--from', 'old-host-quota'] : producer === 'quota-full' ? ['--from', sender] : []
+      const from = producer === 'quota-empty' ? ['--from', ''] : producer === 'quota-short' ? ['--from', 'old-host-quota'] : producer === 'quota-full' ? ['--from', sender] : []
       await run('bash', [path.join(root, 'scripts/quota-probe/report-quota.sh'), '--input', input, '--relay', base, '--send', ...from], { timeout: 5000, env: { ...process.env, HOME: dir, MESH_NODE: '' } })
     } else if (producer === 'wake') {
       const audit = fs.readFileSync(path.join(root, 'scripts/wake-hook.sh'), 'utf8').match(/^audit\(\) \{[\s\S]*?^\}/m)?.[0]; assert.ok(audit)
