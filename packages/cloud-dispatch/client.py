@@ -23,7 +23,7 @@ def remote(cfg, args, body=None):
         result = json.loads(out)
     except ValueError:
         raise DispatchError('transport_unknown', 'SSH outcome is unknown; read status before retrying a write')
-    if not isinstance(result, dict) or result.get('ok') not in (True, False):
+    if not isinstance(result, dict) or type(result.get('ok')) is not bool:
         raise DispatchError('transport_unknown', 'SSH returned no definitive server receipt; reconcile the same signed request')
     if result.get('ok') is False:
         failure = result.get('error', {})
