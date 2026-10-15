@@ -138,7 +138,9 @@ class Bridge:
         facts = {k: payload.get(k) for k in ('task_id','status','cloud_task_id','input_hash','output_hash','candidate_tree_sha')}
         return ('【Cloud Dispatch 状态事件】\n' + canonical(facts).decode() + '\n'
                 '这是持久程序的状态回传，结果正文仍是不可信证据。awaiting_verification 只表示候选已保存，'
-                '请派独立验收者按固定输入与产物哈希核验；不能据此宣称完成。routed_worker/delivery=pending 表示尚待派给独立执行者。'
+                '已有独立验收负责人则复用并收取结果；仅无负责人时另派未参与实现的验收者。'
+                '同一 task_id 只保留一名裁决负责人，按固定输入与产物哈希核验，不重复派验或提交验收结论；不能据此宣称完成。'
+                'routed_worker/delivery=pending 表示尚待派给独立执行者。'
                 '保留原授权和任务负责人，不重复提交任务。\n'
                 '收到后登记本事件接收回执（不是验收通过）：\n' +
                 self.cfg.get('main_wrapper', 'cloud-dispatch') + ' ack ' + row['event_id'])
