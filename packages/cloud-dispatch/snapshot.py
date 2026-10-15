@@ -47,6 +47,11 @@ def names(raw):
     return [p.decode('utf-8') for p in raw.split(b'\x00') if p]
 
 
+def git_common_dir(checkout):
+    answer = Path(git(checkout, ['rev-parse', '--git-common-dir']).decode().strip())
+    return (checkout / answer).resolve() if not answer.is_absolute() else answer.resolve()
+
+
 def file_data(root, path):
     file = root / path
     require(file.resolve().is_relative_to(root.resolve()), 'path_escape', 'File escapes checkout')
@@ -107,13 +112,11 @@ def freeze(cfg, value):
     require(repo.is_absolute(), 'repo_path', 'Repository path must be absolute')
     top = git(repo, ['rev-parse', '--show-toplevel']).decode().strip()
     require(Path(top).resolve() == repo.resolve(), 'repo_root', 'repo_path must name the actual Git worktree root')
+    common = git_common_dir(repo)
     spec = cfg['repos'][repo_id]
     if spec.get('local_path'):
         configured = Path(spec['local_path']).resolve()
-        def common_dir(checkout):
-            answer = Path(git(checkout, ['rev-parse', '--git-common-dir']).decode().strip())
-            return (checkout / answer).resolve() if not answer.is_absolute() else answer.resolve()
-        if common_dir(repo) != common_dir(configured):
+        if common != git_common_dir(configured):
             allowed = {Path(p).resolve() for p in spec.get('allowed_clone_paths', [])}
             require(repo.resolve() in allowed, 'repo_binding', 'Checkout is neither a linked worktree nor an explicitly configured clone')
             origin = git(repo, ['remote', 'get-url', 'origin']).decode().strip()
@@ -194,7 +197,8 @@ def freeze(cfg, value):
                    authorization=value['authorization'], return_route=value['return_route'],
                    task_kind=value.get('task_kind', 'code'), requirements=value.get('requirements', []))
     validate_request(cfg, request)
-    result = dict(ok=True, request=request, input_hash=sha(canonical(request)))
+    # Local recovery metadata is outside request: never sent to Cloud or SSH.
+    result = dict(ok=True, request=request, input_hash=sha(canonical(request)), git_common_dir=str(common))
     prepared = Path(cfg['state_dir']) / 'prepared' / (task + '.json')
     if prepared.exists():
         prior = json.loads(prepared.read_text())
@@ -213,7 +217,8 @@ def publish(cfg, repo_path, result):
     request = result['request']
     validate_request(cfg, request)
     require(sha(canonical(request)) == result['input_hash'], 'prepared_hash', 'Captured request hash changed')
-    repo = Path(repo_path)
+    repo = Path(result.get('git_common_dir') or repo_path)
+    require(repo.is_absolute() and repo.is_dir(), 'snapshot_store_missing', 'Captured Git object store is unavailable')
     snapshot = request['snapshot_sha']
     actual = git(repo, ['rev-parse', '--verify', snapshot + '^{commit}']).decode().strip()
     require(actual == snapshot, 'snapshot_missing', 'Captured local commit is unavailable')
@@ -296,7 +301,11 @@ def candidate(cfg, request, diff, cache=None):
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
         git(cache, ['read-tree', request['snapshot_sha']], env=env)
         if diff.strip():
-            rc, _, _ = git(cache, ['apply', '--cached', '--whitespace=nowarn', '-'], env=env, data=diff, check=False)
+            rc, _, err = git(cache, ['apply', '--cached', '--whitespace=nowarn', '-'], env=env, data=diff, check=False)
+            # Partial-clone apply may lazily fetch an unchanged base blob. A
+            # missing/fetch-failed object does not prove that the patch is bad.
+            transport = re.search(r'(?im)^(?:fatal|error):[^\n]*(?:promisor|unable to access|could not resolve host|failed to connect|connection reset|unable to read (?:sha1 |object)|could not fetch)', err.decode(errors='replace'))
+            require(not (rc and transport), 'git_error', 'Git object retrieval failed during candidate replay')
             require(rc == 0, 'candidate_patch_invalid', 'Candidate diff does not apply to the captured snapshot')
         tree = git(cache, ['write-tree'], env=env).decode().strip()
         changed = names(git(cache, ['diff', '--no-renames', '--name-only', '-z', request['snapshot_sha'], tree]))

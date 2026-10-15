@@ -96,6 +96,7 @@ class Gateway:
             frozen_path = self.root / 'frozen' / (task + '.json')
             save(frozen_path, frozen)
             state = dict(frozen_path=str(frozen_path), frozen_input_hash=frozen['input_hash'],
+                         frozen_bundle_hash=sha(canonical(frozen)),
                          input_hash=frozen['input_hash'], snapshot_sha=frozen['request']['snapshot_sha'],
                          captured_at=now(), capture_receipt=receipt)
             with self.db() as db:
@@ -176,6 +177,8 @@ class Gateway:
                         require(state.get('frozen_path') and state.get('frozen_input_hash'), 'input_not_frozen',
                                 'Legacy pending input was not frozen at submission; create an explicitly reviewed new task')
                         prepared = json.loads(Path(state['frozen_path']).read_text())
+                        require(not state.get('frozen_bundle_hash') or sha(canonical(prepared)) == state['frozen_bundle_hash'],
+                                'prepared_hash', 'Captured local recovery metadata changed')
                         require(prepared['input_hash'] == state['frozen_input_hash'], 'prepared_hash', 'Captured input hash changed')
                         prepared = publish(self.cfg, json.loads(row['spec'])['repo_path'], prepared)
                         save(prepared_path, prepared)
