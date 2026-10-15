@@ -13,8 +13,8 @@ import threading
 import time
 
 from client import remote, signed
-from common import canonical, config, now, require, safe_id, save, sha
-from snapshot import prepare
+from common import DispatchError, canonical, config, now, require, run, safe_id, save, sha
+from snapshot import publish
 
 
 class Gateway:
@@ -39,22 +39,22 @@ class Gateway:
         finally:
             db.close()
 
-    def enqueue(self, spec):
+    def enqueue(self, spec, *, worker_capture=False):
         require(isinstance(spec, dict), 'spec_invalid', 'Expected a prepare specification object')
         task = safe_id(spec['task_id'])
         repo = self.cfg['repos'].get(spec['repo_id'])
         require(repo is not None and repo.get('local_path'), 'repo_unknown', 'Repository needs an explicit configured local_path')
         expected_repo = str(Path(repo['local_path']).resolve())
         spec = dict(spec)
-        spec.setdefault('repo_path', expected_repo)
+        require(isinstance(spec.get('repo_path'), str) and spec['repo_path'],
+                'repo_path_required', 'Explicit repo_path is required; the main checkout is never inferred')
         checkout = Path(spec['repo_path'])
         require(checkout.is_absolute(), 'repo_binding', 'Explicit checkout path must be absolute')
         roots = [Path(p).resolve() for p in repo.get('allowed_checkout_roots', [str(Path(expected_repo).parent)])]
         clones = [Path(p).resolve() for p in repo.get('allowed_clone_paths', [])]
         require(any(checkout.resolve().is_relative_to(root) for root in roots) or checkout.resolve() in clones,
                 'repo_binding', 'Checkout lies outside configured checkout roots')
-        # Actual common-dir / explicitly configured clone identity is checked by the background worker.
-        # Preserve the caller's worktree instead of silently reading the main checkout.
+        # The capture subprocess checks the actual Git worktree root/common-dir.
         target = dict(kind='chat', id=self.cfg['target_thread_id'])
         spec.setdefault('return_route', target)
         require(spec['return_route'] == target, 'route_binding', 'Main wrapper cannot change the original chat')
@@ -68,16 +68,42 @@ class Gateway:
             require(any(source.is_relative_to(root) for root in roots), 'context_source', 'Context source is outside configured task context roots')
         digest = sha(canonical(spec))
         require(len(canonical(spec)) <= 256*1024, 'spec_too_large', 'Prepare specification exceeds 256 KiB')
-        with self.db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            prior = db.execute('SELECT spec_hash FROM tasks WHERE task_id=?', (task,)).fetchone()
+        with open(self.root / (task + '.capture.lock'), 'a+b') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise DispatchError('capture_busy', 'This task is already being captured; retry the same ID')
+            with self.db() as db:
+                prior = db.execute('SELECT spec_hash FROM tasks WHERE task_id=?', (task,)).fetchone()
             if prior:
                 require(prior['spec_hash'] == digest, 'idempotency_conflict', 'Task ID already has a different prepare specification')
-            else:
+                return dict(self.status(task), duplicate=True)
+            timeout = 60 if worker_capture else self.cfg.get('input_capture_timeout_seconds', 2)
+            require(isinstance(timeout, (int, float)) and 0 < timeout <= (60 if worker_capture else 2),
+                    'capture_timeout', 'Coordinator local capture budget must be at most two seconds')
+            rc, out, err, receipt = run([sys.executable, str(Path(__file__).with_name('snapshot.py')),
+                                        '--freeze', self.config_path], data=canonical(spec), timeout=timeout)
+            require(receipt['reason'] != 'timeout', 'input_capture_timeout',
+                    'Input capture exceeded its budget; no task was queued. Delegate capture-json to an independent worker; do not extend or loop the coordinator timeout')
+            try:
+                frozen = json.loads(out)
+            except ValueError:
+                raise DispatchError('input_capture_failed', 'Local input capture did not return a valid receipt; no task was queued')
+            if rc or not frozen.get('ok'):
+                error = frozen.get('error', {})
+                raise DispatchError(error.get('code', 'input_capture_failed'), error.get('message', 'Local capture failed'))
+            require(sha(canonical(frozen['request'])) == frozen['input_hash'], 'prepared_hash', 'Captured request hash changed')
+            frozen_path = self.root / 'frozen' / (task + '.json')
+            save(frozen_path, frozen)
+            state = dict(frozen_path=str(frozen_path), frozen_input_hash=frozen['input_hash'],
+                         input_hash=frozen['input_hash'], snapshot_sha=frozen['request']['snapshot_sha'],
+                         captured_at=now(), capture_receipt=receipt)
+            with self.db() as db:
+                db.execute('BEGIN IMMEDIATE')
                 stamp = now()
                 db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?)',
-                           (task, digest, canonical(spec).decode(), 'prepare_queued', '{}', stamp, stamp))
-        return dict(self.status(task), duplicate=prior is not None)
+                           (task, digest, canonical(spec).decode(), 'prepare_queued', canonical(state).decode(), stamp, stamp))
+        return dict(self.status(task), duplicate=False)
 
     def status(self, task):
         with self.db() as db:
@@ -143,9 +169,15 @@ class Gateway:
                     if prepared_path.exists():
                         prepared = json.loads(prepared_path.read_text())
                         require(sha(canonical(prepared['request'])) == prepared['input_hash'], 'prepared_hash', 'Persisted request hash changed')
+                        require(not state.get('frozen_input_hash') or prepared['input_hash'] == state['frozen_input_hash'],
+                                'prepared_hash', 'Published input differs from captured input')
                     else:
                         self.update(task, 'preparing', prepare_started_at=now())
-                        prepared = prepare(self.cfg, json.loads(row['spec']))
+                        require(state.get('frozen_path') and state.get('frozen_input_hash'), 'input_not_frozen',
+                                'Legacy pending input was not frozen at submission; create an explicitly reviewed new task')
+                        prepared = json.loads(Path(state['frozen_path']).read_text())
+                        require(prepared['input_hash'] == state['frozen_input_hash'], 'prepared_hash', 'Captured input hash changed')
+                        prepared = publish(self.cfg, json.loads(row['spec'])['repo_path'], prepared)
                         save(prepared_path, prepared)
                     self.update(task, 'submit_pending', input_hash=prepared['input_hash'], request_path=str(prepared_path),
                                 snapshot_sha=prepared['request']['snapshot_sha'], prepared_at=now())
@@ -169,6 +201,7 @@ def main():
     parser.add_argument('--config', required=True)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('submit-json').add_argument('spec')
+    sub.add_parser('capture-json', help='Independent worker only: bounded capture for larger checkouts').add_argument('spec')
     sub.add_parser('status').add_argument('task_id')
     sub.add_parser('events').add_argument('--after', type=int, default=0)
     sub.add_parser('ack').add_argument('event_id')
@@ -177,8 +210,8 @@ def main():
     args = parser.parse_args()
     cfg = config(args.config)
     gateway = Gateway(cfg, args.config)
-    if args.command == 'submit-json':
-        result = gateway.enqueue(json.loads(args.spec))
+    if args.command in ('submit-json','capture-json'):
+        result = gateway.enqueue(json.loads(args.spec), worker_capture=args.command == 'capture-json')
     elif args.command == 'status':
         result = gateway.status(args.task_id)
     elif args.command in ('events','ack'):

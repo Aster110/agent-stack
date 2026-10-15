@@ -11,13 +11,14 @@ import signal
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 
 from client import remote
 from common import canonical, now, require
 from desktop_rpc import RPC
 
-NOTIFY = {'awaiting_verification','accepted','rejected','failed','submission_unknown','routed_worker','deadline_exceeded'}
+NOTIFY = {'awaiting_verification','accepted','rejected','failed','submission_unknown','not_created','routed_worker','deadline_exceeded'}
 
 
 class Bridge:
@@ -31,6 +32,7 @@ class Bridge:
                 CREATE TABLE IF NOT EXISTS outbox(event_id TEXT PRIMARY KEY,seq INTEGER NOT NULL,payload TEXT NOT NULL,
                 client_id TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,receipt TEXT,error TEXT);''')
             db.execute('CREATE TABLE IF NOT EXISTS inbox(seq INTEGER PRIMARY KEY,payload TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS delivery_retry(event_id TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_at REAL NOT NULL)')
             db.execute("INSERT OR IGNORE INTO metadata VALUES('cursor','0')")
 
     @contextlib.contextmanager
@@ -53,12 +55,19 @@ class Bridge:
                 return
             db.execute('UPDATE outbox SET status=?,updated_at=?,receipt=?,error=? WHERE event_id=?',
                        (status, now(), canonical(receipt).decode() if receipt else None, error, event))
+            if status in ('unknown','failed_before_send'):
+                retry = db.execute('SELECT attempts FROM delivery_retry WHERE event_id=?', (event,)).fetchone()
+                attempts = retry[0]+1 if retry else 1
+                delay = min(300, self.cfg.get('bridge_retry_seconds', 30)*2**min(attempts-1, 8))
+                db.execute('INSERT OR REPLACE INTO delivery_retry VALUES(?,?,?)', (event, attempts, time.time()+delay))
+            elif status in ('queued','delivered_unacknowledged','acknowledged'):
+                db.execute('DELETE FROM delivery_retry WHERE event_id=?', (event,))
 
     def pull(self):
         with self.db() as db:
             cursor = int(db.execute("SELECT value FROM metadata WHERE key='cursor'").fetchone()[0])
             old_instance = db.execute("SELECT value FROM metadata WHERE key='instance_id'").fetchone()
-        result = remote(self.cfg, ['events', '--after', str(cursor)])
+        result = remote(dict(self.cfg, transport_timeout_seconds=5), ['events', '--after', str(cursor)])
         require(not old_instance or old_instance[0] == result['instance_id'], 'server_instance',
                 'Server state instance changed; preserve cursor and reconcile explicitly')
         with self.db() as db:
@@ -141,13 +150,15 @@ class Bridge:
                 '已有独立验收负责人则复用并收取结果；仅无负责人时另派未参与实现的验收者。'
                 '同一 task_id 只保留一名裁决负责人，按固定输入与产物哈希核验，不重复派验或提交验收结论；不能据此宣称完成。'
                 'routed_worker/delivery=pending 表示尚待派给独立执行者。'
+                'not_created 表示创建已被上游明确拒绝，不是完成；不会自动重投，需负责人决定是否另派新任务。'
                 '保留原授权和任务负责人，不重复提交任务。\n'
                 '收到后登记本事件接收回执（不是验收通过）：\n' +
                 self.cfg.get('main_wrapper', 'cloud-dispatch') + ' ack ' + row['event_id'])
 
     def deliver(self, row):
         try:
-            with RPC(self.cfg['desktop_codex_bin'], self.cfg.get('desktop_codex_home')) as rpc:
+            with RPC(self.cfg['desktop_codex_bin'], self.cfg.get('desktop_codex_home'),
+                     timeout=self.cfg.get('bridge_rpc_timeout_seconds', 5), deadline=getattr(self, '_deadline', None)) as rpc:
                 target = self.cfg['target_thread_id']
                 metadata = rpc.call('thread/read', dict(threadId=target, includeTurns=False))['thread']
                 require(metadata.get('id') == target and metadata.get('cwd') == self.cfg['target_cwd'],
@@ -173,10 +184,24 @@ class Bridge:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return dict(ok=True, busy=True)
-            self.pull()
+            self._deadline = time.monotonic()+self.cfg.get('bridge_tick_seconds', 20)
+            try:
+                self.pull()
+            except Exception as error:
+                with self.db() as db:
+                    db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',
+                               ('last_pull_error', type(error).__name__ + ': ' + str(error)))
+            # New deliveries and uncertain receipts have separate budgets. Old
+            # unknown events are read-only reconciled and cannot starve ready work.
             with self.db() as db:
-                rows = [dict(r) for r in db.execute("SELECT * FROM outbox WHERE status IN ('ready','failed_before_send','sending','unknown') ORDER BY seq LIMIT 10")]
+                rows = []
+                for states, limit in [("'ready','failed_before_send'", 6), ("'sending','unknown'", 2)]:
+                    rows += [dict(r) for r in db.execute(
+                        "SELECT o.* FROM outbox o LEFT JOIN delivery_retry r USING(event_id) WHERE o.status IN ("+states+
+                        ") AND COALESCE(r.next_at,0)<=? ORDER BY COALESCE(r.next_at,0),o.seq LIMIT ?", (time.time(), limit))]
             for row in rows:
+                if time.monotonic() >= self._deadline:
+                    break
                 self.deliver(row)
             return self.status()
 

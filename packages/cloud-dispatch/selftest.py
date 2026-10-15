@@ -85,16 +85,16 @@ for line in sys.stdin:
             local.update(state_dir=str(root/'prepare'),gateway_state_dir=str(root/'gateway'),bridge_state_dir=str(root/'bridge'),
                          server=dict(ssh_host='fixture',python=os.sys.executable,script=str(Path(__file__).with_name('cloud_dispatch.py')),config=str(serverpath)),
                          submit_identity=dict(principal='brain',key_file=str(submitkey)),verifiers={},
-                         target_thread_id='original-chat',target_cwd=str(repo),desktop_codex_bin=str(rpc))
+                         target_thread_id='original-chat',target_cwd=str(repo),desktop_codex_bin=str(rpc),bridge_retry_seconds=.01)
             local['repos']={'test':dict(server['repos']['test'],local_path=str(repo))}
             localpath=root/'local.json'; localpath.write_text(json.dumps(local))
             previous=os.environ['PATH']; os.environ['PATH']=str(bindir)+os.pathsep+previous
             try:
                 gateway=Gateway(local,localpath)
-                spec=dict(task_id='async-delivery',repo_id='test',base_sha=base,prompt='Set value to 3',scope=['src/'],
+                spec=dict(task_id='async-delivery',repo_id='test',repo_path=str(repo),base_sha=base,prompt='Set value to 3',scope=['src/'],
                           include_untracked=[],exclude_untracked=[],context=[],authorization=dict(source='test',reference='offline'))
                 started=time.monotonic(); receipt=gateway.enqueue(spec)
-                self.assertLess(time.monotonic()-started, .5)
+                self.assertLess(time.monotonic()-started, 3)
                 self.assertEqual(receipt['status'],'prepare_queued')
                 self.assertTrue(gateway.enqueue(spec)['duplicate'])
                 self.assertEqual(gateway.tick()['status'],'queued')

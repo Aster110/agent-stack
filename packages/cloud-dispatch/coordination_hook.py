@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 POLICY = '''本会话是调度席位。你负责理解目标、澄清关键取舍、派单、查看回执、独立验收与回传。实质调查、实现、长测试和浏览器操作必须交给执行者。兼容 Linux 且仓库已配置的代码任务，默认通过 cloud-dispatch submit-json 提交 Codex Cloud；需要 GUI/macOS/本机登录的任务派独立本机 worker，不能退回主脑自己做。派单保留任务来源、范围、验收标准和原聊天回程。云端 READY 只表示待验收；已有独立验收负责人则复用并收取结果，仅无负责人时另派未参与实现的验收者。同一 task_id 只保留一名裁决负责人，在固定快照上重放准确 diff、执行验收、提交签名结论，不重复派验或提交验收结论。主脑不能自己签验收。提交后尽快结束当前回合，等待事件回传；不要循环轮询、长时间等待或自己跑构建。可用 shell 仅为受控 cloud-dispatch 快速命令，使用 shlex.join 等价的单引号格式，不能串接 shell。此限制只针对本主脑会话，子 agent 保留执行工具。'''
 
 FAST_TOOLS = {
+    'spawnagent', 'agent', 'followuptask', 'sendmessage', 'listagents', 'interruptagent',
     'collaborationspawnagent', 'collaborationfollowuptask',
     'collaborationsendmessage', 'collaborationlistagents',
     'collaborationinterruptagent',
@@ -54,7 +55,7 @@ def shell_allowed(command, wrapper):
         except ValueError:
             return False
     if action in {'status', 'ack'} and len(argv) == 3:
-        return bool(re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', argv[2]))
+        return bool(re.fullmatch(r'[A-Za-z0-9_.:-]{1,192}', argv[2]))
     if action == 'events' and (len(argv) == 2 or
             (len(argv) == 4 and argv[2] == '--after' and argv[3].isdigit())):
         return True

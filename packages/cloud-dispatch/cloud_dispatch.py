@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.request
 
 from common import DispatchError, Store, atomic, authenticate, canonical, config, now, require, run, save, sha
 from snapshot import cache_snapshot, candidate, prepare, validate_request
@@ -65,21 +66,24 @@ def cli(cfg, store, task, label, args):
 def preflight(cfg, store, task):
     try:
         rc, out, err, _ = cli(cfg, store, task, 'preflight-login', ['login', 'status'])
+        text = (out + err).decode(errors='replace').strip()
+        if text == 'Not logged in' or 'Logged in using an API key' in text:
+            raise DispatchError('login_unavailable', 'Codex ChatGPT subscription login is not ready')
         require(rc == 0 and b'Logged in using ChatGPT' in out + err,
-                'login_unavailable', 'Codex ChatGPT subscription login is not ready')
+                'preflight_unavailable', 'Subscription login status could not be read; retry after cooldown')
         account = json.loads((Path(cfg['codex_home']) / 'auth.json').read_text())
         account_id = (account.get('tokens') or {}).get('account_id') or account.get('account_id')
         require(isinstance(account_id, str) and account_id, 'account_unavailable', 'Account identifier is unavailable')
         digest = sha(account_id.encode())[:16]
         require(digest == cfg.get('expected_account_sha256_16'), 'account_mismatch', 'Codex subscription account does not match configuration')
         rc, version, _, _ = cli(cfg, store, task, 'preflight-version', ['--version'])
-        require(rc == 0, 'cli_unavailable', 'Codex CLI version check failed')
+        require(rc == 0, 'preflight_unavailable', 'Codex CLI version check failed')
         return dict(checked_at=now(), login_status='Logged in using ChatGPT', account_sha256_16=digest,
                     cli_version=version.decode(errors='replace').strip())
     except DispatchError:
         raise
     except (OSError, ValueError, KeyError):
-        raise DispatchError('login_unavailable', 'Codex subscription login could not be verified')
+        raise DispatchError('preflight_unavailable', 'Codex subscription login could not be verified')
 
 
 def cloud_prompt(request):
@@ -101,16 +105,44 @@ def route_unavailable(store, task, error):
                         last_error=str(error))
 
 
+def admission_cooldown(cfg, store):
+    until = time.time() + cfg.get('admission_cooldown_seconds', 30)
+    with store.db(write=True) as db:
+        db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)', ('admission_retry_at', str(until)))
+    return until
+
+
+def defer_start(cfg, store, task, error):
+    return store.update(task, 'queued', retry_at=admission_cooldown(cfg, store),
+                        last_error=str(error), error_code=error.code)
+
+
+def definitive_rejection(rc, out, err, receipt):
+    """A narrowly recognized HTTP rejection is not an ambiguous transport exit."""
+    if rc == 0 or receipt.get('reason') or out.strip():
+        return None
+    text = err.decode(errors='replace').strip()
+    # Official backend-client exec_request + CloudTaskError::Http rendering.
+    # Do not match a status code in a transport error or response-body text.
+    if re.fullmatch(r'Error: http error: create_task failed: POST https://chatgpt\.com/backend-api/wham/tasks failed: 429 Too Many Requests; content-type=[^\r\n;]*; body=.*', text, re.DOTALL):
+        return dict(http_status=429, classification='explicit_http_rejection', error_sha256=sha(err))
+    return None
+
+
 def start_task(cfg, store, row):
     task = row['task_id']
     request = json.loads(row['request'])
     try:
         identity = preflight(cfg, store, task)
     except DispatchError as error:
+        if error.code == 'preflight_unavailable':
+            return defer_start(cfg, store, task, error)
         return route_unavailable(store, task, error)
     try:
         cache_snapshot(cfg, request)
     except DispatchError as error:
+        if error.code == 'git_error':
+            return defer_start(cfg, store, task, error)
         return store.update(task, 'failed', event='failed', last_error=str(error), error_code=error.code)
     # This intent is committed before the only operation that creates an upstream task.
     # A crash from here through task-ID persistence is uncertain, never safe to retry.
@@ -123,6 +155,12 @@ def start_task(cfg, store, row):
         ids = set(re.findall(r'^https://chatgpt\.com/codex/tasks/(task_[A-Za-z0-9_]+)[ \t]*$',
                              out.decode(errors='replace'), re.MULTILINE))
         if len(ids) != 1:
+            rejected = definitive_rejection(rc, out, err, receipt)
+            if rejected:
+                return store.update(task, 'not_created', event='not_created', submit_receipt=receipt,
+                                    rejection=rejected, slot_reserved=False,
+                                    cooldown_until=admission_cooldown(cfg, store), finished_at=now(),
+                                    last_error='Provider explicitly rejected creation; no automatic resubmission')
             return store.update(task, 'submission_unknown', event='submission_unknown', submit_receipt=receipt,
                                 last_error='Submission outcome is unknown; no automatic resubmission', slot_reserved=True)
         upstream = next(iter(ids))
@@ -132,6 +170,40 @@ def start_task(cfg, store, row):
     except Exception as error:
         return store.update(task, 'submission_unknown', event='submission_unknown',
                             last_error=type(error).__name__ + ': submission outcome unknown', slot_reserved=True)
+
+
+def collect_task(cfg, store, row):
+    task, state, request = row['task_id'], json.loads(row['state']), json.loads(row['request'])
+    if state.get('collection_retry_at', 0) > time.time():
+        return None
+    count = state.get('collection_attempts', 0) + 1
+    store.update(task, collection_attempts=count)
+    try:
+        destination = store.artifact_dir(task) / 'result.diff'
+        if state.get('output_hash') and state.get('output_path'):
+            diff = Path(state['output_path']).read_bytes()
+            require(sha(diff) == state['output_hash'], 'output_hash', 'Saved candidate changed during collection')
+            receipt = state['diff_receipt']
+        else:
+            rc, diff, err, receipt = cli(cfg, store, task, 'diff-%06d' % count, ['cloud', 'diff', state['cloud_task_id']])
+            require(rc == 0, 'diff_unavailable', 'Cloud diff is temporarily unavailable')
+            require(len(diff) <= 32*1024*1024, 'diff_too_large', 'Cloud diff exceeds 32 MiB')
+            atomic(destination, diff)
+            store.update(task, output_path=str(destination), diff_path=str(destination), output_hash=sha(diff), diff_receipt=receipt)
+        tree, changed = candidate(cfg, request, diff)
+        return store.update(task, 'awaiting_verification', event='awaiting_verification', finished_at=now(),
+                            output_path=str(destination), diff_path=str(destination), output_hash=sha(diff),
+                            candidate_tree_sha=tree, changed_paths=changed, diff_receipt=receipt,
+                            collection_retry_at=0, acceptance_status='not_verified')
+    except DispatchError as error:
+        if error.code not in ('diff_unavailable', 'git_error'):
+            return store.update(task, 'failed', event='failed', last_error=str(error), error_code=error.code)
+        message, code = str(error), error.code
+    except Exception as error:
+        message, code = type(error).__name__ + ': candidate collection unavailable', 'collection_unavailable'
+    delay = min(300, max(1, cfg['poll_seconds']) * 2 ** min(count-1, 8))
+    return store.update(task, 'collecting', collection_retry_at=time.time()+delay,
+                        last_error=message, error_code=code, slot_reserved=False)
 
 
 def poll_task(cfg, store, row):
@@ -152,20 +224,11 @@ def poll_task(cfg, store, row):
         store.update(task, remote_status=upstream_status, last_polled_at=now(), last_status_receipt=receipt)
         if upstream_status in ('FAILED', 'CANCELLED', 'CANCELED', 'ERROR'):
             return store.update(task, 'failed', event='failed', finished_at=now(), error_code='cloud_' + upstream_status.lower())
-        if upstream_status != 'READY':
+        if upstream_status not in ('READY', 'APPLIED'):
             return None
-        rc, diff, err, receipt = cli(cfg, store, task, 'diff-%06d' % count, ['cloud', 'diff', state['cloud_task_id']])
-        require(rc == 0 and len(diff) <= 32*1024*1024, 'diff_unavailable', 'Cloud diff is unavailable or larger than 32 MiB')
-        destination = store.artifact_dir(task) / 'result.diff'
-        atomic(destination, diff)
-        store.update(task, output_path=str(destination), diff_path=str(destination), output_hash=sha(diff), diff_receipt=receipt)
-        tree, changed = candidate(cfg, request, diff)
-        return store.update(task, 'awaiting_verification', event='awaiting_verification', finished_at=now(),
-                            output_path=str(destination), diff_path=str(destination), output_hash=sha(diff),
-                            candidate_tree_sha=tree, changed_paths=changed, diff_receipt=receipt,
-                            acceptance_status='not_verified')
-    except DispatchError as error:
-        return store.update(task, 'failed', event='failed', last_error=str(error), error_code=error.code)
+        store.update(task, 'collecting', event='collecting', ready_at=now(), slot_reserved=False,
+                     collection_attempts=0, collection_retry_at=0)
+        return collect_task(cfg, store, store.get(task))
     except Exception as error:
         # Status transport failures cannot prove upstream termination or release its slot.
         return store.update(task, last_error=type(error).__name__ + ': polling failed; upstream slot retained')
@@ -184,22 +247,102 @@ def tick(cfg, store):
             store.update(task, 'submission_unknown', event='submission_unknown', slot_reserved=True,
                          last_error='Scheduler restarted during submission; no automatic resubmission')
         with store.db() as db:
-            running = [dict(r) for r in db.execute("SELECT * FROM tasks WHERE status='running' ORDER BY created_at")]
+            running = [dict(r) for r in db.execute("SELECT * FROM tasks WHERE status IN ('running','collecting') ORDER BY created_at")]
         processed = []
         for row in running:
-            result = poll_task(cfg, store, row)
+            result = collect_task(cfg, store, row) if row['status'] == 'collecting' else poll_task(cfg, store, row)
             if result:
                 processed.append(result)
         while True:
             with store.db() as db:
+                cooldown = db.execute("SELECT value FROM metadata WHERE key='admission_retry_at'").fetchone()
+                if cooldown and float(cooldown[0]) > time.time():
+                    break
                 active = db.execute("SELECT count(*) FROM tasks WHERE status IN ('submitting','running','submission_unknown')").fetchone()[0]
-                row = db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+                row = db.execute("SELECT * FROM tasks WHERE status='queued' AND COALESCE(json_extract(state,'$.retry_at'),0)<=? ORDER BY created_at LIMIT 1", (time.time(),)).fetchone()
             if active >= cfg['max_active'] or row is None:
                 break
             processed.append(start_task(cfg, store, dict(row)))
         return dict(ok=True, busy=False, processed=processed)
     finally:
         lock.close()
+
+
+def read_provider_task(cfg, cloud_task_id):
+    """Read the official CLI's task-details endpoint; never create/retry a task."""
+    require(re.fullmatch(r'task_[A-Za-z0-9_]+', cloud_task_id), 'cloud_task_id', 'Invalid provider task ID')
+    auth = json.loads((Path(cfg['codex_home']) / 'auth.json').read_text())
+    tokens = auth.get('tokens') or {}
+    account = tokens.get('account_id') or auth.get('account_id')
+    require(isinstance(account, str) and sha(account.encode())[:16] == cfg['expected_account_sha256_16'],
+            'account_mismatch', 'Provider readback account does not match configuration')
+    require(isinstance(tokens.get('access_token'), str), 'login_unavailable', 'Subscription access token is unavailable')
+    url = 'https://chatgpt.com/backend-api/wham/tasks/' + cloud_task_id
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    request = urllib.request.Request(url, headers={'Authorization': 'Bearer '+tokens['access_token'],
+            'ChatGPT-Account-Id': account, 'User-Agent': 'codex-cli', 'Accept': 'application/json'})
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=15) as response:
+            data = response.read(8*1024*1024+1)
+            require(len(data) <= 8*1024*1024, 'provider_readback', 'Provider task details exceeded the readback limit')
+            return dict(account_sha256_16=sha(account.encode())[:16], http_status=response.status,
+                        body=json.loads(data), fetched_at=now(), url=url)
+    except DispatchError:
+        raise
+    except Exception:
+        raise DispatchError('provider_readback', 'Task details could not be read; unknown submission remains reserved')
+
+
+def adopt(cfg, store, envelope):
+    value = envelope['adoption']
+    principal = authenticate(cfg, 'submitters', value, envelope.get('auth'))
+    task, upstream = value['task_id'], value['cloud_task_id']
+    require(isinstance(upstream, str) and re.fullmatch(r'task_[A-Za-z0-9_]+', upstream), 'cloud_task_id', 'Invalid provider task ID')
+    require(isinstance(value.get('evidence'), dict) and value['evidence'].get('reference'),
+            'evidence_required', 'Operator reconciliation evidence reference is required')
+    row = store.get(task)
+    state = json.loads(row['state'])
+    require(value.get('input_hash') == row['input_hash'], 'input_hash', 'Adoption input hash does not match')
+    if state.get('adopted_by') and state.get('cloud_task_id') == upstream:
+        return dict(store.public(task), duplicate=True)
+    require(row['status'] == 'submission_unknown' and not state.get('cloud_task_id'),
+            'adoption_state', 'Only an unbound unknown submission can be adopted')
+    identity = preflight(cfg, store, task)
+    details = read_provider_task(cfg, upstream)
+    require(details.get('account_sha256_16') == cfg['expected_account_sha256_16'] and details.get('http_status') == 200,
+            'adoption_account', 'Provider readback account/status mismatch')
+    request = json.loads(row['request'])
+    body = details.get('body') or {}
+    assistant = body.get('current_assistant_turn') or {}
+    require((body.get('task') or {}).get('id') == upstream, 'adoption_task', 'Provider returned another task')
+    require(assistant.get('environment_id') == cfg['repos'][request['repo_id']]['env_id'], 'adoption_env', 'Provider environment mismatch')
+    require(assistant.get('branch') == request['branch'], 'adoption_branch', 'Provider branch mismatch')
+    require(assistant.get('base_commit_sha') == request['snapshot_sha'], 'adoption_snapshot', 'Provider snapshot mismatch')
+    user = body.get('current_user_turn') or {}
+    texts = [part.get('text') for item in user.get('input_items', []) if item.get('type') == 'message' and item.get('role') == 'user'
+             for part in item.get('content', []) if part.get('content_type') == 'text']
+    require(texts == [cloud_prompt(request)], 'adoption_prompt', 'Provider original prompt/nonce does not exactly match')
+    receipt_hash = sha(canonical(details))
+    receipt_path = store.artifact_dir(task) / ('adopt-' + receipt_hash + '.json')
+    with store.db(write=True) as db:
+        current = db.execute('SELECT status,state FROM tasks WHERE task_id=?', (task,)).fetchone()
+        current_state = json.loads(current['state'])
+        if current_state.get('adopted_by') and current_state.get('cloud_task_id') == upstream:
+            return dict(store.public(task), duplicate=True)
+        require(current['status'] == 'submission_unknown' and not current_state.get('cloud_task_id'),
+                'adoption_state', 'Submission state changed during readback')
+        bound = db.execute("SELECT task_id FROM tasks WHERE json_extract(state,'$.cloud_task_id')=? AND task_id<>?", (upstream, task)).fetchone()
+        require(bound is None, 'adoption_conflict', 'Provider task ID is already bound to another local task')
+        save(receipt_path, details)
+        current_state.update(cloud_task_id=upstream, cloud_url='https://chatgpt.com/codex/tasks/'+upstream,
+                adopted_by=principal, adopted_at=now(), adoption=value, adoption_receipt_path=str(receipt_path),
+                adoption_receipt_hash=receipt_hash, preflight=identity, slot_reserved=True, poll_count=0, next_poll_at=0,
+                deadline_at=state.get('deadline_at') or (dt.datetime.now(dt.timezone.utc)+dt.timedelta(seconds=cfg['task_deadline_seconds'])).isoformat())
+        db.execute('UPDATE tasks SET status=?,state=?,updated_at=? WHERE task_id=?', ('running', canonical(current_state).decode(), now(), task))
+        store.event(db, task, 'adopted', dict(current_state, task_id=task, input_hash=row['input_hash'], status='running'))
+    return dict(store.public(task), duplicate=False)
 
 
 def verify(cfg, store, envelope):
@@ -265,7 +408,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
     sub = parser.add_subparsers(dest='command', required=True)
-    for cmd in ('prepare','submit','tick','serve','verify'):
+    for cmd in ('prepare','submit','tick','serve','verify','adopt'):
         sub.add_parser(cmd)
     status = sub.add_parser('status')
     status.add_argument('task_id')
@@ -287,6 +430,8 @@ def main():
             result = store.public(args.task_id)
         elif args.command == 'verify':
             result = verify(cfg, store, json.load(sys.stdin))
+        elif args.command == 'adopt':
+            result = adopt(cfg, store, json.load(sys.stdin))
         elif args.command == 'events':
             require(0 < args.limit <= 1000 and args.after >= 0, 'cursor_invalid', 'Invalid event cursor or limit')
             result = events(store, args.after, args.limit)

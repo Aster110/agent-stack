@@ -18,14 +18,16 @@ def remote(cfg, args, body=None):
     server = cfg['server']
     command = shlex.join([server.get('python', '/usr/bin/python3'), server['script'], '--config', server['config']] + args)
     argv = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', server['ssh_host'], command]
-    rc, out, err, _ = run(argv, data=canonical(body) if body is not None else None, timeout=45)
+    rc, out, err, _ = run(argv, data=canonical(body) if body is not None else None, timeout=cfg.get('transport_timeout_seconds', 45))
     try:
         result = json.loads(out)
     except ValueError:
         raise DispatchError('transport_unknown', 'SSH outcome is unknown; read status before retrying a write')
-    if rc or not result.get('ok'):
+    if not result.get('ok'):
         failure = result.get('error', {})
         raise DispatchError(failure.get('code', 'remote_error'), failure.get('message', 'Remote command failed'))
+    if rc:
+        raise DispatchError('transport_unknown', 'Server returned success but SSH did not finish cleanly; reconcile the same signed request')
     return result
 
 
@@ -52,6 +54,8 @@ def main():
     result.add_argument('--output', required=True)
     verifier = sub.add_parser('verify')
     verifier.add_argument('--verdict', required=True)
+    adoption = sub.add_parser('adopt')
+    adoption.add_argument('--adoption', required=True)
     args = parser.parse_args()
     cfg = config(args.config)
     if args.command == 'prepare':
@@ -65,6 +69,9 @@ def main():
     elif args.command == 'verify':
         verdict = json.loads(Path(args.verdict).read_text())
         result = remote(cfg, ['verify'], dict(verdict=verdict, auth=signed(verdict, cfg['verifier_identity'])))
+    elif args.command == 'adopt':
+        adoption = json.loads(Path(args.adoption).read_text())
+        result = remote(cfg, ['adopt'], dict(adoption=adoption, auth=signed(adoption, cfg['submit_identity'])))
     elif args.command == 'status':
         result = remote(cfg, ['status', args.task_id])
     elif args.command == 'events':

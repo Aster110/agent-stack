@@ -8,7 +8,9 @@ import time
 
 
 class RPC:
-    def __init__(self, binary, home=None):
+    def __init__(self, binary, home=None, timeout=30, deadline=None):
+        self.timeout = timeout
+        self.deadline = deadline
         environment = os.environ.copy()
         if home:
             environment['CODEX_HOME'] = home
@@ -45,11 +47,13 @@ class RPC:
         self.process.stdin.write(json.dumps(message) + '\n')
         self.process.stdin.flush()
 
-    def call(self, method, params=None, timeout=30):
+    def call(self, method, params=None, timeout=None):
         self.sequence += 1
         request_id = self.sequence
         self.send({'id': request_id, 'method': method, 'params': params or {}})
-        deadline = time.monotonic()+timeout
+        deadline = time.monotonic()+(self.timeout if timeout is None else timeout)
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
         while time.monotonic() < deadline:
             response = self.messages.get(timeout=max(.1, deadline-time.monotonic()))
             if response is None:

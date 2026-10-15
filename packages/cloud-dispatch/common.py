@@ -108,7 +108,7 @@ def authenticate(cfg, category, body, auth):
     return principal
 
 
-def run(argv, *, cwd=None, env=None, data=None, timeout=45, output_dir=None, label='command'):
+def run(argv, *, cwd=None, env=None, data=None, timeout=45, output_dir=None, label='command', new_session=True):
     """Never use a shell. Large process output goes to private files, not pipe buffers."""
     started = now()
     before = time.monotonic()
@@ -123,16 +123,16 @@ def run(argv, *, cwd=None, env=None, data=None, timeout=45, output_dir=None, lab
     reason = None
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
-                                stdout=out, stderr=err, start_new_session=True)
+                                stdout=out, stderr=err, start_new_session=new_session)
         try:
             proc.communicate(input=data, timeout=timeout)
         except subprocess.TimeoutExpired:
             reason = 'timeout'
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.killpg(proc.pid, signal.SIGTERM) if new_session else proc.terminate()
             try:
                 proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGKILL) if new_session else proc.kill()
                 proc.wait()
         out.flush()
         err.flush()
@@ -151,7 +151,7 @@ def run(argv, *, cwd=None, env=None, data=None, timeout=45, output_dir=None, lab
         return proc.returncode, stdout, stderr, receipt
     finally:
         if proc and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL) if new_session else proc.kill()
             proc.wait()
         out.close()
         err.close()

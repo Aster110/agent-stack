@@ -30,11 +30,14 @@ def in_scope(path, scope):
 
 
 def git(repo, args, *, env=None, data=None, check=True, timeout=45):
+    capture = os.environ.get('CLOUD_DISPATCH_CAPTURE_PROCESS') == '1'
     environment = dict(os.environ, GIT_OPTIONAL_LOCKS='0')
+    if capture:
+        environment['GIT_NO_LAZY_FETCH'] = '1'
     if env:
         environment.update(env)
     rc, out, err, _ = run(['git', '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null', '-C', str(repo)] + args,
-                          env=environment, data=data, timeout=timeout)
+                          env=environment, data=data, timeout=timeout, new_session=not capture)
     if check and rc:
         raise DispatchError('git_error', 'Git operation failed: ' + args[0] + ': ' + err.decode(errors='replace')[:400])
     return out if check else (rc, out, err)
@@ -95,12 +98,15 @@ def validate_request(cfg, request):
         seen.add(name)
 
 
-def prepare(cfg, value):
+def freeze(cfg, value):
+    """Capture immutable local Git objects; this phase never contacts a remote."""
     task = safe_id(value['task_id'])
     repo_id = value['repo_id']
     require(repo_id in cfg['repos'], 'repo_unknown', 'Repository is not configured')
     repo = Path(value['repo_path'])
     require(repo.is_absolute(), 'repo_path', 'Repository path must be absolute')
+    top = git(repo, ['rev-parse', '--show-toplevel']).decode().strip()
+    require(Path(top).resolve() == repo.resolve(), 'repo_root', 'repo_path must name the actual Git worktree root')
     spec = cfg['repos'][repo_id]
     if spec.get('local_path'):
         configured = Path(spec['local_path']).resolve()
@@ -199,7 +205,22 @@ def prepare(cfg, value):
         require(current.decode().strip() == snapshot, 'branch_conflict', 'Local task branch already has another snapshot')
     else:
         git(repo, ['update-ref', ref, snapshot, '0' * len(snapshot)])
-    remote = cfg['repos'][repo_id]['remote_url']
+    return result
+
+
+def publish(cfg, repo_path, result):
+    """Publish a previously captured snapshot without rereading source files."""
+    request = result['request']
+    validate_request(cfg, request)
+    require(sha(canonical(request)) == result['input_hash'], 'prepared_hash', 'Captured request hash changed')
+    repo = Path(repo_path)
+    snapshot = request['snapshot_sha']
+    actual = git(repo, ['rev-parse', '--verify', snapshot + '^{commit}']).decode().strip()
+    require(actual == snapshot, 'snapshot_missing', 'Captured local commit is unavailable')
+    ref = 'refs/heads/' + request['branch']
+    local = git(repo, ['show-ref', '--verify', '--hash', ref]).decode().strip()
+    require(local == snapshot, 'branch_conflict', 'Captured local task branch changed')
+    remote = cfg['repos'][request['repo_id']]['remote_url']
     observed = git(repo, ['ls-remote', '--refs', remote, ref]).decode().strip()
     if observed:
         require(observed.split()[0] == snapshot, 'branch_conflict', 'Remote task branch already has another snapshot')
@@ -208,9 +229,14 @@ def prepare(cfg, value):
         git(repo, ['push', '--force-with-lease=' + ref + ':', remote, snapshot + ':' + ref], timeout=60)
     readback = git(repo, ['ls-remote', '--refs', remote, ref]).decode().split()
     require(readback and readback[0] == snapshot, 'branch_readback', 'Task branch readback did not match snapshot')
+    prepared = Path(cfg['state_dir']) / 'prepared' / (request['task_id'] + '.json')
     save(prepared, result)
-    atomic(prepared.with_suffix('.tracked.patch'), tracked_patch)
+    atomic(prepared.with_suffix('.tracked.patch'), base64.b64decode(request['manifest']['tracked_patch_base64'], validate=True))
     return result
+
+
+def prepare(cfg, value):
+    return publish(cfg, value['repo_path'], freeze(cfg, value))
 
 
 def cache_snapshot(cfg, request):
@@ -270,7 +296,8 @@ def candidate(cfg, request, diff, cache=None):
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
         git(cache, ['read-tree', request['snapshot_sha']], env=env)
         if diff.strip():
-            git(cache, ['apply', '--cached', '--whitespace=nowarn', '-'], env=env, data=diff)
+            rc, _, _ = git(cache, ['apply', '--cached', '--whitespace=nowarn', '-'], env=env, data=diff, check=False)
+            require(rc == 0, 'candidate_patch_invalid', 'Candidate diff does not apply to the captured snapshot')
         tree = git(cache, ['write-tree'], env=env).decode().strip()
         changed = names(git(cache, ['diff', '--no-renames', '--name-only', '-z', request['snapshot_sha'], tree]))
         protected = {f['path'] for f in request['manifest']['files'] if f['kind'] == 'context'}
@@ -281,3 +308,18 @@ def candidate(cfg, request, diff, cache=None):
             require(not entry or entry.split(b' ', 1)[0] in (b'100644', b'100755'),
                     'output_mode', 'Candidate cannot introduce symlinks or submodules')
         return tree, changed
+
+
+if __name__ == '__main__':
+    # A bounded subprocess lets the main-chat wrapper reject slow local capture
+    # instead of acknowledging mutable paths or waiting on network preparation.
+    import sys
+    from common import config
+    os.umask(0o077)
+    try:
+        require(len(sys.argv) == 3 and sys.argv[1] == '--freeze', 'arguments', 'Expected --freeze CONFIG')
+        os.environ['CLOUD_DISPATCH_CAPTURE_PROCESS'] = '1'
+        print(json.dumps(freeze(config(sys.argv[2]), json.load(sys.stdin)), ensure_ascii=False))
+    except Exception as error:
+        print(json.dumps(dict(ok=False, error=dict(code=getattr(error, 'code', 'capture_error'), message=str(error))), ensure_ascii=False))
+        sys.exit(1)
