@@ -729,7 +729,7 @@ ${delegatorNodeId
   // ===== Send =====
   app.post("/api/send", async (req: Request, res: Response) => {
     const fromNodeId = req.headers["x-mesh-node"] as string | undefined
-    const effectiveFrom = fromNodeId ?? `${deviceId}:relay`
+    const effectiveFrom = fromNodeId || `${deviceId}:relay`
     const { to, message, type, replyTo, priority, attachments } = req.body
 
     if (!to || !message) {
@@ -782,6 +782,7 @@ ${delegatorNodeId
   const dispatcher = new DirectDispatcher(validateFullNodeId)
   app.post("/api/dispatch", async (req: Request, res: Response) => {
     const fromNodeId = req.headers["x-mesh-node"] as string | undefined
+    const effectiveFrom = fromNodeId || `${deviceId}:relay`
     const { title, payload, to, project, constraints, todoUid } = req.body ?? {}
 
     if (typeof title !== "string" || title.trim() === "") {
@@ -804,8 +805,8 @@ ${delegatorNodeId
     }
 
     const msg: MeshMessage = {
-      id: genMessageId(fromNodeId ?? "unknown"),
-      from: fromNodeId ?? "unknown",
+      id: genMessageId(effectiveFrom),
+      from: effectiveFrom,
       to: pick.nodeId,
       type: "task",
       // payload 是原文：注入终端的就是它，不包任何信封——
@@ -1009,6 +1010,7 @@ ${delegatorNodeId
   // ===== Broadcast =====
   app.post("/api/broadcast", async (req: Request, res: Response) => {
     const fromNodeId = req.headers["x-mesh-node"] as string | undefined
+    const effectiveFrom = fromNodeId || `${deviceId}:relay`
     const { message, type } = req.body
 
     if (!message) {
@@ -1017,8 +1019,8 @@ ${delegatorNodeId
     }
 
     const msg: MeshMessage = {
-      id: genMessageId(fromNodeId ?? "unknown"),
-      from: fromNodeId ?? "unknown",
+      id: genMessageId(effectiveFrom),
+      from: effectiveFrom,
       to: "*",
       type: (type as MessageType) ?? "broadcast",
       payload: message,
@@ -1027,7 +1029,7 @@ ${delegatorNodeId
 
     store.saveMessage(msg)
 
-    const deliveryText = formatDelivery(fromNodeId, message)
+    const deliveryText = formatDelivery(effectiveFrom, message)
     const result = router.route(msg)
     if (result.action === "broadcast") {
       for (const target of result.targets) {

@@ -174,7 +174,6 @@ audit() {
   [ -z "$body" ] && return 0
   curl -sS --noproxy '*' -m 10 -X POST "${RELAY_URL}/api/send" \
     -H 'Content-Type: application/json' \
-    -H 'X-Mesh-Node: wake-hook' \
     -d "$body" >/dev/null 2>&1 || log "审计写入失败（relay 可能死了；飞书优先，不影响报警）"
 }
 
