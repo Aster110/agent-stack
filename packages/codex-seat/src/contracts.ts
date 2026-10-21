@@ -474,6 +474,8 @@ export interface WalFolded {
   reason?: FailReason
   detail?: string
   fetchedAt: string
+  /** When the result became terminal (completed / failed / rejected, awaiting its receipt). Receipt give-up ages from here, so it survives restarts. */
+  terminalAt?: string
   confirmationRequested?: boolean
   observationSent?: boolean
 }
@@ -508,9 +510,9 @@ export function foldWal(entries: readonly WalEntry[]): Map<string, WalFolded> {
     if (e.op === "active") { if (cur.phase === "observing") cur.phase = "started"; cur.observationSent = false; continue }
     if (e.op === "submitting") { cur.phase = "started"; cur.threadId = e.threadId; continue }
     if (e.op === "started") { cur.phase = "started"; cur.threadId = e.threadId; cur.turnId = e.turnId; continue }
-    if (e.op === "completed") { cur.phase = "completed"; cur.finalText = e.finalText ?? ""; cur.turnId = e.turnId ?? cur.turnId; continue }
-    if (e.op === "failed" && e.awaitingReceipt) { cur.phase = "failed"; cur.reason = e.reason; cur.detail = e.detail; continue }
-    if (e.op === "rejected" && e.awaitingReceipt) { cur.phase = "rejected"; cur.detail = e.detail; continue }
+    if (e.op === "completed") { cur.phase = "completed"; cur.finalText = e.finalText ?? ""; cur.turnId = e.turnId ?? cur.turnId; cur.terminalAt = e.at; continue }
+    if (e.op === "failed" && e.awaitingReceipt) { cur.phase = "failed"; cur.reason = e.reason; cur.detail = e.detail; cur.terminalAt = e.at; continue }
+    if (e.op === "rejected" && e.awaitingReceipt) { cur.phase = "rejected"; cur.detail = e.detail; cur.terminalAt = e.at; continue }
     cur.phase = "done"
   }
   return out

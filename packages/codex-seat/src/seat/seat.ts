@@ -71,6 +71,7 @@ import { atomicWriteFileSync, readJsonSync } from "../state/atomic.js"
 import { StateStore, initialState, rememberMsgIds } from "../state/state-store.js"
 import { WalStore } from "../state/wal.js"
 import type { ChannelInput, ReplyRoute, SeatChannel } from "./channels.js"
+import { createRotatingLog, type LogRotationPolicy } from "./log-rotate.js"
 
 export type SeatLogRecord = Record<string, unknown> & { event: string }
 export type SeatLogger = (rec: SeatLogRecord) => void
@@ -94,6 +95,10 @@ export interface SeatRuntimeOptions {
   instructions?: (context: { nodeId: string; deviceId: string; cwd: string; kind: "seat" | "worker" }) => string
   preserveThreadOnResumeFailure?: boolean
   receiptRetryMs?: number
+  /** 终态回执重投策略（测试压短窗口；生产走缺省） */
+  receiptRetry?: Partial<ReceiptRetryPolicy>
+  /** sidecar.jsonl 大小轮转（缺省 32MB / 留 8 份压缩归档） */
+  logRotation?: Partial<LogRotationPolicy>
   strictPersistence?: boolean
   engine?: IAppServerClient
   /** 缺省动态加载 Lane A 的 src/app-server（A 未合并时必须显式传 engine） */
@@ -108,6 +113,45 @@ export interface SeatRuntimeOptions {
   installSignalHandlers?: boolean
   procOps?: SeatProcOps
 }
+
+/**
+ * 终态回执（done / failed / rejected）重投策略。
+ *
+ * 2026-10-21 s1 主脑：两条 10-13 / 10-14 的 [done] 发往微信，对话早已 idle 过期（iLink errcode=-2 prepare failed），
+ * 对账循环每 5 秒重发一次、每次失败写一行，八天写了 50 万行、sidecar.jsonl 涨到 324MB，永不放弃。
+ * （cc-mesh 的 air2 在 10-17 出过同一个形状的事故：对着已注销的派单方每 5 秒敲一遍。）
+ *
+ * 所以：失败按 backoffMs 退避，最后一档封顶；收件人明确不存在（relay 400/404）持续 goneGraceMs 就放弃；
+ * 任何原因，只要结果终态已过去 giveUpMs 仍发不出去就放弃。放弃 = WAL 记 receipted（detail 写 abandoned:原因），
+ * 回执原文追加进 `<席位目录>/abandoned-receipts.jsonl`——结果不丢，只是不再敲。
+ * giveUpMs 从 WAL 里终态那一行的时间算起，所以重启不会让旧回执重新拿到一轮新的 24 小时。
+ */
+export interface ReceiptRetryPolicy {
+  /** 第 n 次失败后隔多久再试（超出取最后一档）；首档 0 = 下一个对账 tick */
+  backoffMs: readonly number[]
+  goneGraceMs: number
+  giveUpMs: number
+}
+
+/** 退避表以对账 tick（receiptRetryMs，缺省 5 秒）为单位：首次立刻重试，之后 1/2/4/8/16/32/60 个 tick 封顶。缺省即 0/5/10/20/40/80/160/300 秒。 */
+export function receiptBackoffFor(tickMs: number): number[] {
+  return [0, 1, 2, 4, 8, 16, 32, 60].map((k) => k * tickMs)
+}
+
+export const DEFAULT_RECEIPT_RETRY: ReceiptRetryPolicy = {
+  backoffMs: receiptBackoffFor(5_000),
+  goneGraceMs: 30 * 60_000,
+  giveUpMs: 24 * 3600_000,
+}
+
+/** relay 明确说收件人不存在：节点已注销 / 名字不是完整 nodeId，或路由查无此人。 */
+export function isReceiptTargetGone(err: unknown): boolean {
+  if (!(err instanceof MeshHttpError)) return false
+  if (err.status === 404) return true
+  return err.status === 400 && /target must be full nodeId/.test(err.body)
+}
+
+type ReceiptAttempt = { ok: true } | { ok: false; gone: boolean; error: string }
 
 export interface SeatHandle {
   readonly nodeId: string
@@ -231,6 +275,9 @@ class Seat implements SeatHandle {
   private readonly exitCleanup = (): void => this.clearSidecarPid()
   private receiptTimer: NodeJS.Timeout | null = null
   private readonly delivering = new Set<string>()
+  /** msgId → 终态回执重投退避状态（内存；放弃的依据 giveUpMs 来自 WAL，重启不会重置它） */
+  private readonly receiptRetries = new Map<string, { attempts: number; firstFailAt: number; goneSince?: number; nextAt: number }>()
+  private readonly receiptPolicy: ReceiptRetryPolicy
   private readonly scheduled = new Set<string>()
   private readonly blockedDispatch = new Set<string>()
 
@@ -238,7 +285,8 @@ class Seat implements SeatHandle {
     this.env = opts.env ?? process.env
     this.faults = activeFaults(this.env)
     this.paths = seatPaths(config.seat, opts.homeDir ?? os.homedir())
-    this.log = opts.log ?? defaultFileLogger(this.paths.sidecarLog)
+    this.log = opts.log ?? defaultFileLogger(this.paths.sidecarLog, opts.logRotation)
+    this.receiptPolicy = { ...DEFAULT_RECEIPT_RETRY, backoffMs: receiptBackoffFor(opts.receiptRetryMs ?? 5_000), ...opts.receiptRetry }
     this.exit = opts.exit ?? ((code) => process.exit(code))
     fs.mkdirSync(this.paths.logDir, { recursive: true })
     this.stateStore = new StateStore(this.paths.state, opts.strictPersistence)
@@ -1264,6 +1312,10 @@ class Seat implements SeatHandle {
   // 回执
   // =========================================================================
   private async sendReceipt(msg: Incoming, r: Receipt): Promise<boolean> {
+    return (await this.trySendReceipt(msg, r)).ok
+  }
+
+  private async trySendReceipt(msg: Incoming, r: Receipt): Promise<ReceiptAttempt> {
     const from = "node" in r ? r.node : msg.to
     try {
       const route = msg.replyRoute ?? (isMachineReceiptMessage(msg) ? this.opts.brainResultRoute : undefined)
@@ -1285,20 +1337,70 @@ class Seat implements SeatHandle {
       if (sent.status !== "accepted" && sent.status !== "delivered") throw new Error(`receipt pending: relay returned ${sent.status}`)
       }
       this.log({ event: "receipt", kind: r.kind, nonce: msg.nonce, to: msg.from, from })
-      return true
+      return { ok: true }
     } catch (err) {
-      this.log({ event: "receipt-send-failed", kind: r.kind, nonce: msg.nonce, error: String(err) })
+      // 错误串可能带一大段操作提示（微信 -2 的 hint 有 400 多字），日志里只留头部，免得失败本身撑大日志。
+      this.log({ event: "receipt-send-failed", kind: r.kind, nonce: msg.nonce, error: String(err).slice(0, 300) })
+      return { ok: false, gone: isReceiptTargetGone(err), error: String(err) }
+    }
+  }
+
+  private retryDue(st: { nextAt: number } | undefined): boolean {
+    return st == null || Date.now() >= st.nextAt
+  }
+
+  private backoffFor(attempts: number): number {
+    const b = this.receiptPolicy.backoffMs
+    return b.length === 0 ? 0 : b[Math.min(attempts - 1, b.length - 1)]!
+  }
+
+  /**
+   * 终态回执发送失败后调用：记一次失败、排下次重投；到了放弃条件就把回执原文落到 abandoned-receipts.jsonl、
+   * WAL 记 receipted（detail=abandoned:…）让对账循环不再碰它。返回 true = 已放弃。
+   */
+  private noteTerminalReceiptFailure(msg: Incoming, r: Receipt, res: Extract<ReceiptAttempt, { ok: false }>, threadId?: string): boolean {
+    const now = Date.now()
+    const st = this.receiptRetries.get(msg.msgId) ?? { attempts: 0, firstFailAt: now, nextAt: now }
+    st.attempts++
+    if (res.gone) st.goneSince ??= now
+    else delete st.goneSince
+    const p = this.receiptPolicy
+    const terminalAt = Date.parse(this.wal.fold().get(msg.msgId)?.terminalAt ?? "")
+    const age = Math.max(now - st.firstFailAt, Number.isFinite(terminalAt) ? now - terminalAt : 0)
+    const reason = st.goneSince != null && now - st.goneSince >= p.goneGraceMs
+      ? "target-gone"
+      : age >= p.giveUpMs ? "give-up" : null
+    if (!reason) {
+      st.nextAt = now + this.backoffFor(st.attempts)
+      this.receiptRetries.set(msg.msgId, st)
       return false
     }
+    this.receiptRetries.delete(msg.msgId)
+    const record = {
+      at: iso(), msgId: msg.msgId, from: msg.from, to: msg.to, nonce: msg.nonce, kind: r.kind, reason,
+      attempts: st.attempts, firstFailAt: new Date(st.firstFailAt).toISOString(), ageMs: age,
+      lastError: res.error.slice(0, 500), receipt: formatReceipt(r),
+    }
+    try {
+      fs.appendFileSync(path.join(this.paths.home, "abandoned-receipts.jsonl"), `${JSON.stringify(record)}\n`, { mode: 0o600 })
+    } catch (err) {
+      this.log({ event: "receipt-abandon-record-failed", msgId: msg.msgId, error: String(err) })
+    }
+    this.appendWal(this.walFor(msg, "receipted", { ...(threadId ? { threadId } : {}), detail: shortDetail(`abandoned:${reason} attempts=${st.attempts} ${res.error}`) }))
+    this.log({ event: "receipt-abandoned", kind: r.kind, msgId: msg.msgId, nonce: msg.nonce, to: msg.from, reason, attempts: st.attempts, ageMs: age, error: res.error.slice(0, 300) })
+    return true
   }
 
   private async sendDone(msg: Incoming, threadId: string, body: string, ms: number): Promise<void> {
     if (this.delivering.has(msg.msgId)) return
     this.delivering.add(msg.msgId)
     try {
-      if (await this.sendReceipt(msg, { kind: "done", nonce: msg.nonce, node: msg.to, thread: threadId, ms, body })) {
+      const r: Receipt = { kind: "done", nonce: msg.nonce, node: msg.to, thread: threadId, ms, body }
+      const res = await this.trySendReceipt(msg, r)
+      if (res.ok) {
+        this.receiptRetries.delete(msg.msgId)
         this.appendWal(this.walFor(msg, "receipted", { threadId }))
-      }
+      } else this.noteTerminalReceiptFailure(msg, r, res, threadId)
     } catch (error) { this.log({ event: "outbox-error", msgId: msg.msgId, error: String(error) }) }
     finally { this.delivering.delete(msg.msgId) }
   }
@@ -1314,9 +1416,12 @@ class Seat implements SeatHandle {
     if (this.delivering.has(msg.msgId)) return
     this.delivering.add(msg.msgId)
     try {
-      if (await this.sendReceipt(msg, { kind: "failed", nonce: msg.nonce, node: msg.to, reason, detail })) {
+      const r: Receipt = { kind: "failed", nonce: msg.nonce, node: msg.to, reason, detail }
+      const res = await this.trySendReceipt(msg, r)
+      if (res.ok) {
+        this.receiptRetries.delete(msg.msgId)
         this.appendWal(this.walFor(msg, "receipted"))
-      }
+      } else this.noteTerminalReceiptFailure(msg, r, res)
     } catch (error) { this.log({ event: "outbox-error", msgId: msg.msgId, error: String(error) }) }
     finally { this.delivering.delete(msg.msgId) }
   }
@@ -1325,8 +1430,12 @@ class Seat implements SeatHandle {
     if (this.delivering.has(msg.msgId)) return
     this.delivering.add(msg.msgId)
     try {
-      if (await this.sendReceipt(msg, { kind: "rejected", nonce: msg.nonce, node: msg.to, reason: "sender-not-allowed" }))
+      const r: Receipt = { kind: "rejected", nonce: msg.nonce, node: msg.to, reason: "sender-not-allowed" }
+      const res = await this.trySendReceipt(msg, r)
+      if (res.ok) {
+        this.receiptRetries.delete(msg.msgId)
         this.appendWal(this.walFor(msg, "receipted"))
+      } else this.noteTerminalReceiptFailure(msg, r, res)
     } catch (error) { this.log({ event: "outbox-error", msgId: msg.msgId, error: String(error) }) }
     finally { this.delivering.delete(msg.msgId) }
   }
@@ -1335,6 +1444,8 @@ class Seat implements SeatHandle {
     if (this.stopped) return
     for (const f of this.wal.fold().values()) {
       if (this.activeTurns.has(f.msgId) || this.delivering.has(f.msgId)) continue
+      // 失败过的回执按退避表等；没到点这一 tick 跳过（不退避 = 每 5 秒一轮全量重发 + 每次一行日志）
+      if (!this.retryDue(this.receiptRetries.get(f.msgId))) continue
       const msg: Incoming = { msgId: f.msgId, seq: f.seq, to: f.to, from: f.from, nonce: f.nonce,
         payload: f.payload ?? "", messageType: f.messageType, replyTo: f.replyTo, replyRoute: f.replyRoute }
       if (f.phase === "completed") void this.sendDone(msg, f.threadId ?? CTL_THREAD, f.finalText ?? "", 0)
@@ -1759,9 +1870,7 @@ function meshAttachments(meta: MeshMessage["meta"]): { images: string[]; lines: 
   return { images, lines: `\n${lines.join("\n")}` }
 }
 
-function defaultFileLogger(file: string): SeatLogger {
-  return (rec) => {
-    const line = `${JSON.stringify({ at: iso(), ...rec })}\n`
-    try { fs.appendFileSync(file, line) } catch { /* 日志写不动不该弄死席位 */ }
-  }
+function defaultFileLogger(file: string, rotation?: Partial<LogRotationPolicy>): SeatLogger {
+  const sink = createRotatingLog(file, rotation)
+  return (rec) => sink.write(`${JSON.stringify({ at: iso(), ...rec })}\n`)
 }

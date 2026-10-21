@@ -17,7 +17,8 @@ export * from "./app-server/index.js"
 
 // ---- Lane B：席位核心 ----
 export { runSeat } from "./seat/seat.js"
-export type { SeatHandle, SeatLogRecord, SeatLogger, SeatProcOps, SeatRuntimeOptions } from "./seat/seat.js"
+export type { ReceiptRetryPolicy, SeatHandle, SeatLogRecord, SeatLogger, SeatProcOps, SeatRuntimeOptions } from "./seat/seat.js"
+export type { LogRotationPolicy } from "./seat/log-rotate.js"
 export type { SeatChannel, ChannelInput, ChannelOutput, ReplyRoute } from "./seat/channels.js"
 /** 结构化合并缺省的 config 解析（内存里造配置用；从磁盘读走 CLI 那份带校验的） */
 export { resolveSeatConfig, loadSeatConfig as loadSeatConfigFile } from "./seat/config.js"
