@@ -119,6 +119,8 @@ Claude App 为可选项：同仓 relay 保留 `/api/events` SSE、`/api/sync` pu
 
 accepted、HTTP 200、PID 或单元测试通过均不能替代微信与文件闭环。微信空闲过期返回 errcode=-2 时，本人先发信恢复会话；不能反复重跑模型补发。
 
+回执发不出去时 runtime 按 0/5/10/20/40/80/160/300 秒退避重投，不会每 5 秒敲一次；终态结果满 24 小时仍送不到（或收件节点已注销满 30 分钟）就放弃：WAL 记 `receipted`（detail 以 `abandoned:` 开头），回执原文追加到席位目录的 `abandoned-receipts.jsonl`，要找“做完了没收到”的结果先查它。席位日志 `log/sidecar.jsonl` 超过 32MB 自动轮转成 `sidecar.jsonl.<UTC 时间戳>.gz`（后台压缩，保留最新 8 份），不会无限增长。
+
 ## 7. 升级、回退与旧主脑
 
 新发行版进入新源码目录并 bootstrap，保存旧源码、服务定义与停止后的一致状态备份。运行任务排空后再切换；源码启动时核对 profile 创建时的 sourceHash，源码被改动会拒绝启动。不要在旧 profile 改 source 字段绕过校验。
