@@ -31,7 +31,7 @@ export class CompositeTransport implements ITransport {
     // 没原件才回落到"用 text 合成一条"——只剩老调用方会走，语义上是"匿名文本投递"。
     const wire: MeshMessage = msg ?? {
       id: genMessageId(this.opts.deviceId),
-      from: this.opts.deviceId,
+      from: `${this.opts.deviceId}:relay`,
       to: target.nodeId,
       type: "chat",
       payload: text,

@@ -26,7 +26,7 @@
 # 选项:
 #   --source codex|claude   跑哪个探针（未给 --input 时必填）
 #   --input FILE            用现成探针 JSON（- = stdin），跳过跑探针
-#   --from NODE             上报方节点名（默认 <hostname>-quota）
+#   --from NODE             完整 device:name；省略或旧短名由 relay 提供 device:relay
 #   --to NODE              收件人（默认 @ledger 记账哨兵；也可传主脑完整 nodeId）
 #   --type TYPE            mesh 消息类型（默认 quota_report）
 #   --relay URL           relay 地址（默认 http://localhost:19800）
@@ -42,7 +42,7 @@ PY="${PYTHON:-python3}"
 
 SOURCE=""
 INPUT=""
-FROM_NODE="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')-quota"
+FROM_NODE=""
 TO_NODE="@ledger"
 MSG_TYPE="quota_report"
 RELAY="http://localhost:19800"
@@ -66,6 +66,15 @@ while [ $# -gt 0 ]; do
     *) echo "未知参数: $1" >&2; exit 2;;
   esac
 done
+
+# The relay owns the real device identity. A legacy short label stays metadata,
+# never a wire author; preserve explicit complete node identities for validation.
+SEND_HEADERS=(-H 'Content-Type: application/json')
+WIRE_FROM=""
+if [[ "$FROM_NODE" =~ ^[^:[:space:]]+:[^:[:space:]]+$ ]]; then
+  WIRE_FROM="$FROM_NODE"
+  SEND_HEADERS+=(-H "X-Mesh-Node: $WIRE_FROM")
+fi
 
 # 1) 取探针 JSON
 #
@@ -143,7 +152,7 @@ if [ "$MODE" = "dry-run" ]; then
   echo "$BODY" | "$PY" -m json.tool --no-ensure-ascii 2>/dev/null || echo "$BODY"
   echo
   echo "--- 等价 curl ---"
-  echo "curl -s -X POST '$ENDPOINT' -H 'Content-Type: application/json' -H 'X-Mesh-Node: $FROM_NODE' -d '<上面的 body>'"
+  echo "curl -s -X POST '$ENDPOINT' -H 'Content-Type: application/json' ${WIRE_FROM:+-H 'X-Mesh-Node: $WIRE_FROM'} -d '<上面的 body>'"
   exit 0
 fi
 
@@ -155,7 +164,7 @@ if ! curl -sm 3 --noproxy '*' "$RELAY/api/status" >/dev/null 2>&1; then
 fi
 
 RESP="$(curl -s -m "$TIMEOUT" --noproxy '*' -X POST "$ENDPOINT" \
-        -H 'Content-Type: application/json' -H "X-Mesh-Node: $FROM_NODE" -d "$BODY" 2>&1)" || {
+        "${SEND_HEADERS[@]}" -d "$BODY" 2>&1)" || {
   echo "⚠️  发送出错，body 未丢失：" >&2
   echo "$BODY"
   exit 0
