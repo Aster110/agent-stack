@@ -1201,3 +1201,108 @@ test("防线1 失败方向：relay 问不到头时**拒绝启动**（抛 CursorA
 function h_engineTurnCount(relay: FakeRelay): number {
   return relay.sends.length
 }
+
+test("seat: AGENTS.md 改了，下一轮开跑前换一代引擎、resume 原主 thread 再跑；没改不换", async () => {
+  // 注入：去掉 runTurnLocked 里的规则闸 → stopCalls 一直是 0 → 红
+  const h = await start({
+    scenario: { defaultTurn: { startedAfterMs: 5, completeAfterMs: 20, outcome: { status: "completed", finalText: "ok" } } },
+    preState: (home) => fs.writeFileSync(path.join(home, "AGENTS.md"), "规则 v1\n"),
+  })
+  const agents = path.join(h.home, "AGENTS.md")
+  const doneCount = (): number => receipts(h.relay).filter((r) => r.kind === "done").length
+  const send = async (nonce: string, n: number): Promise<void> => {
+    h.relay.deliver(h.nodeId, PROBE, `ping nonce=${nonce}`)
+    await waitFor(() => doneCount() >= n, 5000, `[done] #${n}`)
+  }
+  try {
+    const main = h.state().mainThreadId!
+    assert.ok(h.logs.some((l) => l.event === "thread-started" && typeof l.agentsMd === "string"), "装载时记下指纹")
+    await send("am1", 1)
+    assert.equal(h.engine.stopCalls, 0, "没改不换代")
+
+    fs.writeFileSync(agents, "规则 v2\n")
+    await send("am2", 2)
+    assert.equal(h.engine.stopCalls, 1, "改了换一代")
+    assert.equal(h.engine.startCalls, 2)
+    assert.equal(h.state().mainThreadId, main, "主 thread 不许换")
+    assert.equal(h.engine.threadResumes.at(-1)?.threadId, main, "新引擎上 resume 的是原主 thread")
+    assert.equal(h.engine.turnCalls[1]!.threadId, main)
+    const r = h.logs.find((l) => l.event === "agents-md-engine-restart")!
+    assert.equal(r.trigger, "turn")
+    assert.deepEqual(r.changed, [fs.realpathSync(agents)])
+    const iRestart = h.logs.findIndex((l) => l.event === "agents-md-engine-restarted")
+    const iResume = h.logs.findIndex((l, i) => i > h.logs.indexOf(r) && l.event === "thread-resumed")
+    assert.ok(iRestart > 0 && iResume > 0, "换代后要 resume 并记一笔")
+    assert.equal(receipts(h.relay).filter((x) => x.kind === "failed").length, 0, "换代那一轮不许失败")
+
+    await send("am3", 3)
+    assert.equal(h.engine.stopCalls, 1, "换过之后没再改就不再换")
+    assert.deepEqual(h.engine.concurrencyViolations, [])
+  } finally { await h.stop() }
+})
+
+test("seat: 规则改了但引擎上别的 thread 正在跑——不打断它，这一轮照旧规则跑，等全空闲再换代", async () => {
+  // 注入：engineIdle() 只看 engineUp（不看在飞 turn / enginePins）→ 换代打断 worker 那一轮（假引擎 stop 会把在飞 turn 结成 interrupted）→ 红
+  const h = await start({
+    scenario: {
+      turns: [{ match: { textIncludes: "nonce=busyW" }, startedAfterMs: 5, completeAfterMs: 1500, outcome: { status: "completed", finalText: "ok" } }],
+      defaultTurn: { startedAfterMs: 5, completeAfterMs: 20, outcome: { status: "completed", finalText: "ok" } },
+    },
+    preState: (home) => fs.writeFileSync(path.join(home, "AGENTS.md"), "v1\n"),
+  })
+  const agents = path.join(h.home, "AGENTS.md")
+  try {
+    h.relay.deliver(h.nodeId, PROBE, "warm nonce=busy0")
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "done" && r.nonce === "busy0"), 5000, "busy0 done")
+    h.relay.deliver(h.nodeId, PROBE, "[ctl:spawn] role=worker cwd=/tmp agent=codex nonce=spwB desc=busy")
+    const w = (await waitFor(() => receipts(h.relay).find((r) => r.kind === "bootstrap-ready"), 5000, "worker ready") as Extract<Receipt, { kind: "bootstrap-ready" }>).node
+    // worker 这一轮 1.5 秒；它在跑的时候改规则、给主席位发一条
+    h.relay.deliver(w, PROBE, "long nonce=busyW")
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "seen" && r.nonce === "busyW"), 5000, "worker seen")
+    fs.writeFileSync(agents, "v2\n")
+    h.relay.deliver(h.nodeId, PROBE, "ping nonce=busyM")
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "done" && r.nonce === "busyM"), 5000, "main done")
+    assert.equal(h.engine.stopCalls, 0, "worker 还在跑，绝不换代")
+    assert.ok(h.logs.some((l) => l.event === "agents-md-reload-deferred"))
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "done" && r.nonce === "busyW"), 5000, "worker done")
+    assert.equal(receipts(h.relay).filter((r) => r.kind === "failed").length, 0, "worker 那一轮不许被打断")
+    await waitFor(() => h.engine.stopCalls === 1, 8000, "空闲后补换代")
+    const r = h.logs.find((l) => l.event === "agents-md-engine-restart")!
+    assert.equal(r.trigger, "idle")
+  } finally { await h.stop() }
+})
+
+test("seat: 引擎里别的 thread（原生子 agent）有在飞回合 / 报 active 时不换代；它收尾后空闲补换", async () => {
+  // 注入：engineIdle() 不看 engineBusy（只看席位自己投的 turn）→ 主席位那一轮当场换代 → stopCalls=1 → 红
+  const h = await start({
+    scenario: { defaultTurn: { startedAfterMs: 5, completeAfterMs: 20, outcome: { status: "completed", finalText: "ok" } } },
+    preState: (home) => fs.writeFileSync(path.join(home, "AGENTS.md"), "v1\n"),
+  })
+  const agents = path.join(h.home, "AGENTS.md")
+  const done = (nonce: string) => waitFor(() => receipts(h.relay).some((r) => r.kind === "done" && r.nonce === nonce), 5000, `${nonce} done`)
+  try {
+    h.relay.deliver(h.nodeId, PROBE, "warm nonce=sub0")
+    await done("sub0")
+    // 子 agent 的 thread 在引擎里起了一轮，席位没投过它，也不会收到它的 [done]
+    h.engine.emit({ type: "turn.started", threadId: "child-th-1", turnId: "child-tu-1", at: Date.now() })
+    fs.writeFileSync(agents, "v2\n")
+    h.relay.deliver(h.nodeId, PROBE, "ping nonce=sub1")
+    await done("sub1")
+    assert.equal(h.engine.stopCalls, 0, "子 agent 还在跑，绝不换代")
+    assert.ok(h.logs.some((l) => l.event === "agents-md-reload-deferred"))
+    h.engine.emit({ type: "turn.completed", threadId: "child-th-1", turnId: "child-tu-1", status: "completed", finalText: "x", errorMessage: null, durationMs: 1, at: Date.now() })
+    await waitFor(() => h.engine.stopCalls === 1, 12000, "子 agent 收尾后空闲补换")
+    assert.equal(h.logs.find((l) => l.event === "agents-md-engine-restart")!.trigger, "idle")
+    await waitFor(() => h.logs.some((l) => l.event === "agents-md-engine-restarted"), 5000, "第一次换代收尾")
+
+    // thread/status 报 active（没有 turn 事件）也算忙；报 idle 就放行
+    h.engine.emit({ type: "thread.status", threadId: "child-th-2", status: "active" })
+    fs.writeFileSync(agents, "v3\n")
+    h.relay.deliver(h.nodeId, PROBE, "ping nonce=sub2")
+    await done("sub2")
+    assert.equal(h.engine.stopCalls, 1, "子 thread 报 active 时不换代")
+    h.engine.emit({ type: "thread.status", threadId: "child-th-2", status: "idle" })
+    await waitFor(() => h.engine.stopCalls === 2, 12000, "子 thread 报 idle 后补换")
+    assert.equal(receipts(h.relay).filter((r) => r.kind === "failed").length, 0)
+  } finally { await h.stop() }
+})

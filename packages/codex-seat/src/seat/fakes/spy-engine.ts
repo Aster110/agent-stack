@@ -31,6 +31,7 @@ export class SpyEngine implements IAppServerClient {
   readonly concurrencyViolations: string[] = []
   maxConcurrentTurns = 0
   stopCalls = 0
+  startCalls = 0
 
   private readonly threadInfo = new Map<string, { config?: Record<string, unknown>; instructions?: string }>()
   private readonly activeOnThread = new Map<string, string>()
@@ -45,7 +46,7 @@ export class SpyEngine implements IAppServerClient {
   configOf(threadId: string): Record<string, unknown> | undefined { return this.threadInfo.get(threadId)?.config }
   instructionsOf(threadId: string): string | undefined { return this.threadInfo.get(threadId)?.instructions }
 
-  async start(): Promise<EngineInfo> { return await this.inner.start() }
+  async start(): Promise<EngineInfo> { this.startCalls++; return await this.inner.start() }
   async stop(opts?: EngineStopOptions): Promise<void> { this.stopCalls++; return await this.inner.stop(opts) }
   isAlive(): boolean { return this.inner.isAlive() }
   info(): EngineInfo | null { return this.inner.info() }
