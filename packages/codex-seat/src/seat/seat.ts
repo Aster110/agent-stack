@@ -64,6 +64,7 @@ import {
   type WorkerRecord,
 } from "../contracts.js"
 import { RealAppServerClient } from "../app-server/index.js"
+import { agentsChainFingerprint, bounceDirFor, resolveCodexHome, type AgentsChainFingerprint } from "./agents-md.js"
 import { clearPidFile, writePidFile } from "../proc/pidfile.js"
 import { MeshClient } from "../mesh/mesh-client.js"
 import { LedgerClient } from "../mesh/ledger-client.js"
@@ -252,6 +253,12 @@ class Seat implements SeatHandle {
   private readonly threadLocks = new Map<string, Promise<unknown>>()
   private readonly loops = new Map<string, SyncLoopHandle>()
   private readonly loadedThreads = new Set<string>()
+  /**
+   * threadId → 引擎装载这条 thread 时（或上次刷新时）的 AGENTS 链指纹。
+   * 常驻 app-server 不会自己重读 AGENTS.md（见 agents-md.ts 头注），每轮开跑前拿磁盘现状比一次，
+   * 变了就让引擎重读，规则改动下一轮就生效，不用重启席位。
+   */
+  private readonly agentsFp = new Map<string, { cwd: string; fp: AgentsChainFingerprint }>()
   private readonly activeTurns = new Map<string, { threadId: string; handle: TurnHandle; msg: Incoming }>()
   private readonly observed = new Set<string>()
   private readonly awaiting = new Set<string>()
@@ -499,6 +506,7 @@ class Seat implements SeatHandle {
     } else if (ev.type === "engine.lost") {
       this.engineUp = false
       this.loadedThreads.clear()
+      this.agentsFp.clear()
       // 这一代已经没了：state 里的 pid/pgid 立刻作废，别让别人拿着回收过的 pid 去 kill
       if (this.st?.engine) { this.st.engine = null; this.saveState() }
       this.log({ event: "engine-lost", reason: ev.reason })
@@ -1026,9 +1034,12 @@ class Seat implements SeatHandle {
     }
     if (current && resumable && !this.fault("fresh-thread-on-restart")) {
       try {
+        // 指纹在装载**之前**取：装载途中文件又变了，下一轮会多刷新一次，而不是漏掉
+        const fp = this.agentsFingerprint(t.cwd)
         const info = await this.engine.threadResume({ threadId: current, cwd: t.cwd, developerInstructions: instructions, config: cfg })
         this.loadedThreads.add(info.threadId)
-        this.log({ event: "thread-resumed", nodeId, threadId: info.threadId, model: info.model, opMs: info.opMs, meshNode: meshNodeOf(cfg) })
+        this.rememberAgentsFp(info.threadId, t.cwd, fp)
+        this.log({ event: "thread-resumed", nodeId, threadId: info.threadId, model: info.model, opMs: info.opMs, meshNode: meshNodeOf(cfg), agentsMd: fp?.hash ?? null })
         return info.threadId
       } catch (err) {
         if (this.opts.preserveThreadOnResumeFailure) throw err
@@ -1038,13 +1049,56 @@ class Seat implements SeatHandle {
       this.log({ event: "thread-replaced", nodeId, oldThreadId: current, reason: "fault:fresh-thread-on-restart" })
     }
 
+    const fp = this.agentsFingerprint(t.cwd)
     const info = await this.engine.threadStart({ cwd: t.cwd, developerInstructions: instructions, config: cfg })
     this.loadedThreads.add(info.threadId)
+    this.rememberAgentsFp(info.threadId, t.cwd, fp)
+    if (current && current !== info.threadId) this.agentsFp.delete(current)
     if (t.kind === "seat") this.st.mainThreadId = info.threadId
     else if (this.st.workers[nodeId]) this.st.workers[nodeId]!.threadId = info.threadId
     this.saveState()
-    this.log({ event: "thread-started", nodeId, threadId: info.threadId, model: info.model, opMs: info.opMs, meshNode: meshNodeOf(cfg) })
+    this.log({ event: "thread-started", nodeId, threadId: info.threadId, model: info.model, opMs: info.opMs, meshNode: meshNodeOf(cfg), agentsMd: fp?.hash ?? null })
     return info.threadId
+  }
+
+  // =========================================================================
+  // AGENTS 链：常驻引擎不会自己重读，席位每轮替它看一眼
+  // =========================================================================
+  private agentsFingerprint(cwd: string): AgentsChainFingerprint | null {
+    try {
+      return agentsChainFingerprint(cwd, resolveCodexHome(this.engine?.info()?.codexHome || this.config.codex.home, this.env))
+    } catch (err) {
+      this.log({ event: "agents-md-fingerprint-failed", cwd, error: String(err) })
+      return null
+    }
+  }
+
+  private rememberAgentsFp(threadId: string, cwd: string, fp: AgentsChainFingerprint | null): void {
+    if (fp) this.agentsFp.set(threadId, { cwd, fp })
+    else this.agentsFp.delete(threadId)
+  }
+
+  /**
+   * 这一轮开跑前：磁盘上的 AGENTS 链和引擎装着的不一样，就让引擎重读（cwd 弹走再弹回）。
+   * 只在持有该 thread 的锁、且它没有在飞 turn 时调用——正在进行的对话一个字都不打断。
+   * 刷新失败不挡这一轮：照旧规则跑，日志留 agents-md-reload-failed，下一轮再试。
+   */
+  private async reloadAgentsMdIfChanged(threadId: string, cwd: string): Promise<void> {
+    if (!this.engine.threadReloadProjectDocs) return
+    const now = this.agentsFingerprint(cwd)
+    if (!now) return
+    const had = this.agentsFp.get(threadId)
+    if (had && had.cwd === cwd && had.fp.hash === now.hash) return
+    const before = new Map((had?.fp.files ?? []).map((f) => [f.path, f.sha]))
+    const changed = now.files.filter((f) => before.get(f.path) !== f.sha).map((f) => f.path)
+    for (const p of before.keys()) if (!now.files.some((f) => f.path === p)) changed.push(p)
+    try {
+      const r = await this.engine.threadReloadProjectDocs(threadId, cwd, bounceDirFor(cwd))
+      this.agentsFp.set(threadId, { cwd, fp: now })
+      this.log({ event: "agents-md-reloaded", threadId, from: had?.fp.hash ?? null, to: now.hash, changed, opMs: r.opMs })
+    } catch (err) {
+      this.log({ event: "agents-md-reload-failed", threadId, from: had?.fp.hash ?? null, to: now.hash, changed, error: String(err) })
+    }
   }
 
   // =========================================================================
@@ -1079,6 +1133,7 @@ class Seat implements SeatHandle {
     let handle: TurnHandle
     const media = usableImages(msg.images)
     const refused = msg.imagesRefused ? `\n[图片未能作为原生输入（引擎拒绝：${shortDetail(msg.imagesRefused)}）；正文照常，图片路径见上文，可用工具读取。]` : ""
+    await this.reloadAgentsMdIfChanged(threadId, this.targetFor(msg.to)?.cwd ?? this.agentsFp.get(threadId)?.cwd ?? this.config.cwd)
     try {
       this.appendWal(this.walFor(msg, "submitting", { threadId }))
       this.markResumable(threadId)
@@ -1492,6 +1547,7 @@ class Seat implements SeatHandle {
 
     try {
       if (this.fault("fail-thread-start")) throw new Error("fault:fail-thread-start")
+      const spawnFp = this.agentsFingerprint(ctl.cwd)
       const info = await this.engine.threadStart({
         cwd: ctl.cwd,
         developerInstructions: buildWorkerInstructions({
@@ -1514,6 +1570,7 @@ class Seat implements SeatHandle {
       this.st.workers[reg.nodeId] = record
       this.saveState()
       this.loadedThreads.add(info.threadId)
+      this.rememberAgentsFp(info.threadId, ctl.cwd, spawnFp)
       this.startLoop(reg.nodeId)
 
       // 两条 bootstrap 都由 sidecar 机器级发出，署名是**新 worker**（不是席位）。
@@ -1551,6 +1608,7 @@ class Seat implements SeatHandle {
     await this.mesh.unregister(ctl.node).catch((err) => this.log({ event: "unregister-failed", nodeId: ctl.node, error: String(err) }))
     delete this.st.workers[ctl.node]
     this.loadedThreads.delete(w.threadId)
+    this.agentsFp.delete(w.threadId)
     this.saveState()
     this.log({ event: "worker-closed", nodeId: ctl.node })
     await this.sendDone(m, CTL_THREAD, `closed ${ctl.node}`, Date.now() - t0)

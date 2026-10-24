@@ -27,6 +27,9 @@ export class SpyEngine implements IAppServerClient {
   readonly turnCalls: TurnStartRequest[] = []
   readonly interrupts: Array<{ threadId: string; turnId: string | null }> = []
   readonly compactCalls: string[] = []
+  /** threadReloadProjectDocs 调用记录；reloadFailure 非空时照这个报错（测「刷新失败不挡这一轮」） */
+  readonly reloadCalls: Array<{ threadId: string; cwd: string; bounceCwd: string; at: number; turnsBefore: number }> = []
+  reloadFailure: string | null = null
   /** 同一 thread 上出现第二个未收尾的 turn = 席位层的串行队列漏了 */
   readonly concurrencyViolations: string[] = []
   maxConcurrentTurns = 0
@@ -123,6 +126,13 @@ export class SpyEngine implements IAppServerClient {
   async turnInterrupt(threadId: string, turnId: string): Promise<void> {
     this.interrupts.push({ threadId, turnId })
     await this.inner.turnInterrupt(threadId, turnId)
+  }
+
+  async threadReloadProjectDocs(threadId: string, cwd: string, bounceCwd: string): Promise<{ opMs: number }> {
+    this.reloadCalls.push({ threadId, cwd, bounceCwd, at: Date.now(), turnsBefore: this.turnCalls.length })
+    if (this.reloadFailure) throw new Error(this.reloadFailure)
+    if (this.activeOnThread.has(threadId)) this.concurrencyViolations.push(`reload during turn on ${threadId}`)
+    return this.inner.threadReloadProjectDocs ? await this.inner.threadReloadProjectDocs(threadId, cwd, bounceCwd) : { opMs: 0 }
   }
 
   async compact(threadId: string, timeoutMs: number): Promise<CompactOutcome> {

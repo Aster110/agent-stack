@@ -1201,3 +1201,67 @@ test("防线1 失败方向：relay 问不到头时**拒绝启动**（抛 CursorA
 function h_engineTurnCount(relay: FakeRelay): number {
   return relay.sends.length
 }
+
+test("seat: AGENTS.md 改了，下一轮开跑前让引擎重读一次；没改不动；刷新失败不挡这一轮、下一轮再试", async () => {
+  // 注入：去掉 runTurnLocked 里的 reloadAgentsMdIfChanged → reloadCalls 一直是 0 → 红
+  const h = await start({ scenario: { defaultTurn: { startedAfterMs: 5, completeAfterMs: 20, outcome: { status: "completed", finalText: "ok" } } } })
+  const agents = path.join(h.home, "AGENTS.md")
+  const doneCount = (): number => receipts(h.relay).filter((r) => r.kind === "done").length
+  const send = async (nonce: string, n: number): Promise<void> => {
+    h.relay.deliver(h.nodeId, PROBE, `ping nonce=${nonce}`)
+    await waitFor(() => doneCount() >= n, 5000, `[done] #${n}`)
+  }
+  try {
+    fs.writeFileSync(agents, "规则 v1\n")
+    // 主 thread 是 runSeat 里就开好的（那时还没有 AGENTS.md）：第一轮看到新文件，重读一次
+    await send("am1", 1)
+    assert.equal(h.engine.reloadCalls.length, 1, "装载后新出现的 AGENTS.md 也要重读")
+    await send("am2", 2)
+    assert.equal(h.engine.reloadCalls.length, 1, "没改就不重读")
+
+    fs.writeFileSync(agents, "规则 v2\n")
+    await send("am3", 3)
+    assert.equal(h.engine.reloadCalls.length, 2)
+    const r = h.engine.reloadCalls[1]!
+    assert.equal(r.cwd, h.home)
+    assert.equal(r.bounceCwd, path.dirname(h.home))
+    assert.equal(r.turnsBefore, 2, "重读必须发生在这一轮 turn/start 之前")
+    const st = h.state()
+    assert.equal(r.threadId, st.mainThreadId)
+    const ok = h.logs.filter((l) => l.event === "agents-md-reloaded")
+    assert.equal(ok.length, 2)
+    assert.deepEqual(ok[1]!.changed, [fs.realpathSync(agents)])
+
+    h.engine.reloadFailure = "boom"
+    fs.writeFileSync(agents, "规则 v3\n")
+    await send("am4", 4)
+    assert.equal(h.engine.reloadCalls.length, 3)
+    assert.ok(h.logs.some((l) => l.event === "agents-md-reload-failed" && String(l.error).includes("boom")), "失败要留日志")
+    h.engine.reloadFailure = null
+    await send("am5", 5)
+    assert.equal(h.engine.reloadCalls.length, 4, "上次没刷成功，这一轮要再试")
+    await send("am6", 6)
+    assert.equal(h.engine.reloadCalls.length, 4)
+    assert.deepEqual(h.engine.concurrencyViolations, [], "重读不许撞上在飞的 turn")
+  } finally { await h.stop() }
+})
+
+test("seat: 规则在一轮进行中改了，不打断这一轮；等它跑完、下一轮开跑前才重读", async () => {
+  const h = await start({ scenario: { defaultTurn: { startedAfterMs: 5, completeAfterMs: 300, outcome: { status: "completed", finalText: "ok" } } } })
+  const agents = path.join(h.home, "AGENTS.md")
+  try {
+    fs.writeFileSync(agents, "v1\n")
+    h.relay.deliver(h.nodeId, PROBE, "ping nonce=mid1")
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "done"), 5000, "[done] #1")
+    const base = h.engine.reloadCalls.length
+    h.relay.deliver(h.nodeId, PROBE, "ping nonce=mid2")
+    h.relay.deliver(h.nodeId, PROBE, "ping nonce=mid3")
+    await waitFor(() => receipts(h.relay).some((r) => r.kind === "seen" && r.nonce === "mid2"), 5000, "mid2 [seen]")
+    fs.writeFileSync(agents, "v2\n") // mid2 正在跑
+    await waitFor(() => receipts(h.relay).filter((r) => r.kind === "done").length >= 3, 6000, "[done] #3")
+    assert.equal(h.engine.interrupts.length, 0, "进行中的那一轮不许被打断")
+    assert.equal(h.engine.reloadCalls.length, base + 1)
+    assert.equal(h.engine.reloadCalls[base]!.turnsBefore, 2, "重读排在 mid2 之后、mid3 之前")
+    assert.deepEqual(h.engine.concurrencyViolations, [])
+  } finally { await h.stop() }
+})
