@@ -560,6 +560,11 @@ class Seat implements SeatHandle {
         this.engineBusy.delete(ev.threadId)
       }
     }
+    // 子 agent 这类别的 thread 一收尾就是空闲点：有欠着的换代就当场补，不等 5 秒的表
+    if ((ev.type === "turn.completed" || ev.type === "thread.status") && this.agentsReloadPending && this.engineIdle()) {
+      const p = this.agentsReloadPending
+      void this.restartEngineForAgents(p.threadId, p.changed, "idle")
+    }
   }
 
   // =========================================================================

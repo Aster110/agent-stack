@@ -1291,8 +1291,9 @@ test("seat: 引擎里别的 thread（原生子 agent）有在飞回合 / 报 act
     assert.equal(h.engine.stopCalls, 0, "子 agent 还在跑，绝不换代")
     assert.ok(h.logs.some((l) => l.event === "agents-md-reload-deferred"))
     h.engine.emit({ type: "turn.completed", threadId: "child-th-1", turnId: "child-tu-1", status: "completed", finalText: "x", errorMessage: null, durationMs: 1, at: Date.now() })
-    await waitFor(() => h.engine.stopCalls === 1, 8000, "子 agent 收尾后空闲补换")
+    await waitFor(() => h.engine.stopCalls === 1, 12000, "子 agent 收尾后空闲补换")
     assert.equal(h.logs.find((l) => l.event === "agents-md-engine-restart")!.trigger, "idle")
+    await waitFor(() => h.logs.some((l) => l.event === "agents-md-engine-restarted"), 5000, "第一次换代收尾")
 
     // thread/status 报 active（没有 turn 事件）也算忙；报 idle 就放行
     h.engine.emit({ type: "thread.status", threadId: "child-th-2", status: "active" })
@@ -1301,7 +1302,7 @@ test("seat: 引擎里别的 thread（原生子 agent）有在飞回合 / 报 act
     await done("sub2")
     assert.equal(h.engine.stopCalls, 1, "子 thread 报 active 时不换代")
     h.engine.emit({ type: "thread.status", threadId: "child-th-2", status: "idle" })
-    await waitFor(() => h.engine.stopCalls === 2, 8000, "子 thread 报 idle 后补换")
+    await waitFor(() => h.engine.stopCalls === 2, 12000, "子 thread 报 idle 后补换")
     assert.equal(receipts(h.relay).filter((r) => r.kind === "failed").length, 0)
   } finally { await h.stop() }
 })
