@@ -1271,3 +1271,37 @@ test("seat: 规则改了但引擎上别的 thread 正在跑——不打断它，
     assert.equal(r.trigger, "idle")
   } finally { await h.stop() }
 })
+
+test("seat: 引擎里别的 thread（原生子 agent）有在飞回合 / 报 active 时不换代；它收尾后空闲补换", async () => {
+  // 注入：engineIdle() 不看 engineBusy（只看席位自己投的 turn）→ 主席位那一轮当场换代 → stopCalls=1 → 红
+  const h = await start({
+    scenario: { defaultTurn: { startedAfterMs: 5, completeAfterMs: 20, outcome: { status: "completed", finalText: "ok" } } },
+    preState: (home) => fs.writeFileSync(path.join(home, "AGENTS.md"), "v1\n"),
+  })
+  const agents = path.join(h.home, "AGENTS.md")
+  const done = (nonce: string) => waitFor(() => receipts(h.relay).some((r) => r.kind === "done" && r.nonce === nonce), 5000, `${nonce} done`)
+  try {
+    h.relay.deliver(h.nodeId, PROBE, "warm nonce=sub0")
+    await done("sub0")
+    // 子 agent 的 thread 在引擎里起了一轮，席位没投过它，也不会收到它的 [done]
+    h.engine.emit({ type: "turn.started", threadId: "child-th-1", turnId: "child-tu-1", at: Date.now() })
+    fs.writeFileSync(agents, "v2\n")
+    h.relay.deliver(h.nodeId, PROBE, "ping nonce=sub1")
+    await done("sub1")
+    assert.equal(h.engine.stopCalls, 0, "子 agent 还在跑，绝不换代")
+    assert.ok(h.logs.some((l) => l.event === "agents-md-reload-deferred"))
+    h.engine.emit({ type: "turn.completed", threadId: "child-th-1", turnId: "child-tu-1", status: "completed", finalText: "x", errorMessage: null, durationMs: 1, at: Date.now() })
+    await waitFor(() => h.engine.stopCalls === 1, 8000, "子 agent 收尾后空闲补换")
+    assert.equal(h.logs.find((l) => l.event === "agents-md-engine-restart")!.trigger, "idle")
+
+    // thread/status 报 active（没有 turn 事件）也算忙；报 idle 就放行
+    h.engine.emit({ type: "thread.status", threadId: "child-th-2", status: "active" })
+    fs.writeFileSync(agents, "v3\n")
+    h.relay.deliver(h.nodeId, PROBE, "ping nonce=sub2")
+    await done("sub2")
+    assert.equal(h.engine.stopCalls, 1, "子 thread 报 active 时不换代")
+    h.engine.emit({ type: "thread.status", threadId: "child-th-2", status: "idle" })
+    await waitFor(() => h.engine.stopCalls === 2, 8000, "子 thread 报 idle 后补换")
+    assert.equal(receipts(h.relay).filter((r) => r.kind === "failed").length, 0)
+  } finally { await h.stop() }
+})

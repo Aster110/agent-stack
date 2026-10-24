@@ -270,6 +270,12 @@ class Seat implements SeatHandle {
   /** 自己发起的换代：engine.lost 不当故障处理（不打 engine-lost、不排重试） */
   private plannedEngineRestart = false
   private agentsTimer: NodeJS.Timeout | null = null
+  /**
+   * 引擎里**所有** thread 的在飞回合（threadId → turnId；"status" = thread/status 报 active）。
+   * 不只是席位自己投的那些：codex 原生子 agent（spawn_agent）是引擎里另一条 thread，能跨轮活着，
+   * 席位的 activeTurns 看不见它，换代会连进程组把它杀掉。按引擎事件记，非空就不换代。
+   */
+  private readonly engineBusy = new Map<string, Set<string>>()
   private readonly activeTurns = new Map<string, { threadId: string; handle: TurnHandle; msg: Incoming }>()
   private readonly observed = new Set<string>()
   private readonly awaiting = new Set<string>()
@@ -494,6 +500,7 @@ class Seat implements SeatHandle {
 
   private onEngineEvent(ev: EngineEvent): void {
     this.eventCounts[ev.type] = (this.eventCounts[ev.type] ?? 0) + 1
+    this.trackEngineBusy(ev)
     if (ev.type === "request.unresponsive") {
       const a = this.activeTurns.get(ev.msgId)
       if (a) void this.observe(a.msg, a.threadId, a.handle.turnId)
@@ -519,17 +526,39 @@ class Seat implements SeatHandle {
         this.engineUp = false
         this.loadedThreads.clear()
         this.agentsFp.clear()
+        this.engineBusy.clear()
         return
       }
       this.engineUp = false
       this.loadedThreads.clear()
       this.agentsFp.clear()
+      this.engineBusy.clear()
       // 这一代已经没了：state 里的 pid/pgid 立刻作废，别让别人拿着回收过的 pid 去 kill
       if (this.st?.engine) { this.st.engine = null; this.saveState() }
       this.log({ event: "engine-lost", reason: ev.reason })
       this.scheduleEngineRetry()
     } else if (ev.type === "rate.limits") {
       this.lastRateLimits = ev.snapshot
+    }
+  }
+
+  /** 引擎事件 → engineBusy。turn.started 记上、turn.completed 划掉；thread/status 报空闲 / 没装载就整条清掉。 */
+  private trackEngineBusy(ev: EngineEvent): void {
+    if (ev.type === "turn.started") {
+      const s = this.engineBusy.get(ev.threadId) ?? new Set<string>()
+      s.add(ev.turnId)
+      this.engineBusy.set(ev.threadId, s)
+    } else if (ev.type === "turn.completed" && ev.status !== "inProgress") {
+      const s = this.engineBusy.get(ev.threadId)
+      if (s) { s.delete(ev.turnId); if (s.size === 0) this.engineBusy.delete(ev.threadId) }
+    } else if (ev.type === "thread.status") {
+      if (ev.status === "active") {
+        const s = this.engineBusy.get(ev.threadId) ?? new Set<string>()
+        s.add("status")
+        this.engineBusy.set(ev.threadId, s)
+      } else {
+        this.engineBusy.delete(ev.threadId)
+      }
     }
   }
 
@@ -1119,7 +1148,7 @@ class Seat implements SeatHandle {
   /** 整台引擎此刻没有任何活：没有占着的 turn、没有在飞 / 待确认的 turn、没有压缩、没在换代。 */
   private engineIdle(): boolean {
     return this.engineUp && !this.stopped && !this.engineMaintenance && this.enginePins === 0 && this.engineOps === 0 &&
-      this.activeTurns.size === 0 && this.compacting.size === 0 &&
+      this.activeTurns.size === 0 && this.compacting.size === 0 && this.engineBusy.size === 0 &&
       ![...this.recovering.values()].some((a) => !a.released)
   }
 
@@ -1140,6 +1169,7 @@ class Seat implements SeatHandle {
       this.engineUp = false
       this.loadedThreads.clear()
       this.agentsFp.clear()
+      this.engineBusy.clear()
       this.plannedEngineRestart = false
       if (this.engineRetryTimer) { clearTimeout(this.engineRetryTimer); this.engineRetryTimer = null }
       await this.tryStartEngine()
@@ -1621,6 +1651,8 @@ class Seat implements SeatHandle {
     const t0 = Date.now()
     const ctl: ControlMessage | null = parseControlMessage(msg.payload)
     if (!ctl) { await this.finishFailed(msg, "bad-control", "not a control message"); return }
+    // 正在为规则换代引擎：等它换完再动引擎（否则 spawn / compact 会打在半死的引擎上）
+    while (this.engineMaintenance) await this.engineMaintenance
     this.log({ event: "control", kind: ctl.kind, from: msg.from, msgId: msg.msgId })
     try {
       switch (ctl.kind) {
