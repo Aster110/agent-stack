@@ -5,7 +5,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
-import { agentsChainFingerprint, bounceDirFor, projectDocDirs, resolveCodexHome } from "./agents-md.js"
+import { agentsChainFingerprint, projectDocDirs, resolveCodexHome } from "./agents-md.js"
 
 function tree(): { root: string; repo: string; cwd: string; home: string } {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agents-md-")))
@@ -69,12 +69,10 @@ test("agents-md: 软链跟到目标内容（s1 的 ~/.codex/AGENTS.md 就是软�
   assert.notEqual(agentsChainFingerprint(t.cwd, t.home).hash, a.hash)
 })
 
-test("agents-md: 没有 git 根只看 cwd；codexHome 取值顺序 显式 > CODEX_HOME > ~/.codex；bounce 取父目录", () => {
+test("agents-md: 没有 git 根只看 cwd；codexHome 取值顺序 显式 > CODEX_HOME > ~/.codex", () => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agents-md-nogit-")))
   assert.deepEqual(projectDocDirs(dir), [dir])
   assert.equal(resolveCodexHome("/x", { CODEX_HOME: "/y", HOME: "/h" }), "/x")
   assert.equal(resolveCodexHome(null, { CODEX_HOME: "/y", HOME: "/h" }), "/y")
   assert.equal(resolveCodexHome("", { HOME: "/h" }), "/h/.codex")
-  assert.equal(bounceDirFor("/a/b"), "/a")
-  assert.equal(bounceDirFor("/"), os.tmpdir())
 })

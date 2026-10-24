@@ -57,8 +57,6 @@ export interface ScriptedServerScript {
   exitAfterMs?: number | null
   failThreadStart?: string | null
   failThreadResume?: string | null
-  /** thread/settings/update 失败：第 N 次（从 1 数）起回这个错；缺省全成功 */
-  failSettingsUpdate?: { fromCall: number; message: string } | null
   failTurnStart?: { code: number; message: string } | null
   /** 前几次提交被独立 Compact turn 占用；模拟 ACK 前到达的外来通知。 */
   compactBusyAttempts?: number
@@ -131,7 +129,6 @@ function main(): void {
 
   let threadSeq = 0
   let turnSeq = 0
-  let settingsCalls = 0
   let compactBusyAttempts = script.compactBusyAttempts ?? 0
   let srSeq = 90_000
   const threads = new Set<string>()
@@ -247,15 +244,6 @@ function main(): void {
             turn: { id: turnId, status: "interrupted", error: null, items: [], durationMs: 1 },
           })
         }
-        return
-      }
-
-      case "thread/settings/update": {
-        settingsCalls++
-        const f = script.failSettingsUpdate
-        if (f && settingsCalls >= f.fromCall) return replyErr(msg.id, -32000, f.message)
-        reply(msg.id, {})
-        notify("thread/settings/updated", { threadId: msg.params?.threadId })
         return
       }
 

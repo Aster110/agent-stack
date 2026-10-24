@@ -64,7 +64,7 @@ import {
   type WorkerRecord,
 } from "../contracts.js"
 import { RealAppServerClient } from "../app-server/index.js"
-import { agentsChainFingerprint, bounceDirFor, resolveCodexHome, type AgentsChainFingerprint } from "./agents-md.js"
+import { agentsChainFingerprint, resolveCodexHome, type AgentsChainFingerprint } from "./agents-md.js"
 import { clearPidFile, writePidFile } from "../proc/pidfile.js"
 import { MeshClient } from "../mesh/mesh-client.js"
 import { LedgerClient } from "../mesh/ledger-client.js"
@@ -259,6 +259,17 @@ class Seat implements SeatHandle {
    * 变了就让引擎重读，规则改动下一轮就生效，不用重启席位。
    */
   private readonly agentsFp = new Map<string, { cwd: string; fp: AgentsChainFingerprint }>()
+  /** 正为 AGENTS 链换代引擎：新的一轮、新的 turn 都先等它换完（否则会撞上 engineUp=false） */
+  private engineMaintenance: Promise<void> | null = null
+  /** 从决定提交到这一轮收尾、正占着引擎的 turn 数；>0 时绝不为了规则换代 */
+  private enginePins = 0
+  /** 正在引擎上做的 thread 操作（装载 / 开 worker / 手动压缩）数；>0 时同样不换代 */
+  private engineOps = 0
+  /** 规则变了但当时引擎上还有别的活、没能换代：空闲时补换 */
+  private agentsReloadPending: { threadId: string; changed: string[] } | null = null
+  /** 自己发起的换代：engine.lost 不当故障处理（不打 engine-lost、不排重试） */
+  private plannedEngineRestart = false
+  private agentsTimer: NodeJS.Timeout | null = null
   private readonly activeTurns = new Map<string, { threadId: string; handle: TurnHandle; msg: Incoming }>()
   private readonly observed = new Set<string>()
   private readonly awaiting = new Set<string>()
@@ -504,6 +515,12 @@ class Seat implements SeatHandle {
     } else if (ev.type === "mcp.startup") {
       if (ev.name === "node_repl" && /ready|ok|success/i.test(ev.status)) this.nodeReplReady = true
     } else if (ev.type === "engine.lost") {
+      if (this.plannedEngineRestart) {
+        this.engineUp = false
+        this.loadedThreads.clear()
+        this.agentsFp.clear()
+        return
+      }
       this.engineUp = false
       this.loadedThreads.clear()
       this.agentsFp.clear()
@@ -1014,6 +1031,15 @@ class Seat implements SeatHandle {
 
   /** 保证该 nodeId 的 thread 在引擎里可用；返回 threadId。resume 失败就换新的并回写 state。 */
   private async ensureThreadFor(nodeId: string): Promise<string> {
+    this.engineOps++
+    try {
+      return await this.ensureThreadForInner(nodeId)
+    } finally {
+      this.engineOps--
+    }
+  }
+
+  private async ensureThreadForInner(nodeId: string): Promise<string> {
     const t = this.targetFor(nodeId)
     if (!t) throw new Error(`unknown node ${nodeId}`)
     if (this.fault("single-thread-routing") && t.kind === "worker" && this.st.mainThreadId) {
@@ -1078,33 +1104,71 @@ class Seat implements SeatHandle {
     else this.agentsFp.delete(threadId)
   }
 
-  /**
-   * 这一轮开跑前：磁盘上的 AGENTS 链和引擎装着的不一样，就让引擎重读（cwd 弹走再弹回）。
-   * 只在持有该 thread 的锁、且它没有在飞 turn 时调用——正在进行的对话一个字都不打断。
-   * 刷新失败不挡这一轮：照旧规则跑，日志留 agents-md-reload-failed，下一轮再试。
-   */
-  private async reloadAgentsMdIfChanged(threadId: string, cwd: string): Promise<void> {
-    if (!this.engine.threadReloadProjectDocs) return
+  /** 这条 thread 装着的 AGENTS 链和磁盘现状不一样 → 返回变了哪些文件；一样（或量不出来）→ null */
+  private agentsChanged(threadId: string, cwd: string): string[] | null {
     const now = this.agentsFingerprint(cwd)
-    if (!now) return
+    if (!now) return null
     const had = this.agentsFp.get(threadId)
-    if (had && had.cwd === cwd && had.fp.hash === now.hash) return
+    if (had && had.cwd === cwd && had.fp.hash === now.hash) return null
     const before = new Map((had?.fp.files ?? []).map((f) => [f.path, f.sha]))
     const changed = now.files.filter((f) => before.get(f.path) !== f.sha).map((f) => f.path)
     for (const p of before.keys()) if (!now.files.some((f) => f.path === p)) changed.push(p)
-    try {
-      const r = await this.engine.threadReloadProjectDocs(threadId, cwd, bounceDirFor(cwd))
-      this.agentsFp.set(threadId, { cwd, fp: now })
-      this.log({ event: "agents-md-reloaded", threadId, from: had?.fp.hash ?? null, to: now.hash, changed, opMs: r.opMs })
-    } catch (err) {
-      this.log({ event: "agents-md-reload-failed", threadId, from: had?.fp.hash ?? null, to: now.hash, changed, error: String(err) })
-    }
+    return changed
+  }
+
+  /** 整台引擎此刻没有任何活：没有占着的 turn、没有在飞 / 待确认的 turn、没有压缩、没在换代。 */
+  private engineIdle(): boolean {
+    return this.engineUp && !this.stopped && !this.engineMaintenance && this.enginePins === 0 && this.engineOps === 0 &&
+      this.activeTurns.size === 0 && this.compacting.size === 0 &&
+      ![...this.recovering.values()].some((a) => !a.released)
+  }
+
+  /**
+   * 换一代引擎让它重读 AGENTS 链：stop → start → resume 主 thread（id 不变；worker 的 thread 下一轮再 resume）。
+   * 只在 engineIdle() 时调；调用方同步检查、同步调用（中间不 await），别的 turn 才插不进来。
+   */
+  private restartEngineForAgents(threadId: string, changed: string[], trigger: "turn" | "idle"): Promise<void> {
+    const run = (async () => {
+      const t0 = Date.now()
+      this.log({ event: "agents-md-engine-restart", threadId, changed, trigger })
+      this.plannedEngineRestart = true
+      try {
+        await this.engine.stop({ graceMs: 2000 })
+      } catch (err) {
+        this.log({ event: "engine-stop-failed", error: String(err) })
+      }
+      this.engineUp = false
+      this.loadedThreads.clear()
+      this.agentsFp.clear()
+      this.plannedEngineRestart = false
+      if (this.engineRetryTimer) { clearTimeout(this.engineRetryTimer); this.engineRetryTimer = null }
+      await this.tryStartEngine()
+      if (this.engineUp) {
+        await this.ensureThreadFor(this.st.nodeId).catch((err) => this.log({ event: "thread-resume-after-restart-failed", error: String(err) }))
+      }
+      this.agentsReloadPending = null
+      this.log({ event: "agents-md-engine-restarted", threadId, ms: Date.now() - t0, engineUp: this.engineUp, agentsMd: this.agentsFp.get(this.st.mainThreadId ?? "")?.fp.hash ?? null })
+    })().finally(() => { this.engineMaintenance = null })
+    this.engineMaintenance = run
+    return run
+  }
+
+  /** 之前因为引擎忙没换成的：每 5 秒看一眼，空闲了就补换；换完（或没得换）就停表。 */
+  private ensureAgentsTimer(): void {
+    if (this.agentsTimer) return
+    this.agentsTimer = setInterval(() => {
+      const p = this.agentsReloadPending
+      if (!p || this.stopped) { if (this.agentsTimer) clearInterval(this.agentsTimer); this.agentsTimer = null; return }
+      if (this.engineIdle()) void this.restartEngineForAgents(p.threadId, p.changed, "idle")
+    }, 5000)
+    this.agentsTimer.unref?.()
   }
 
   // =========================================================================
   // 一轮对话
   // =========================================================================
   private async runTurn(msg: Incoming): Promise<void> {
+    while (this.engineMaintenance) await this.engineMaintenance
     if (!this.engineUp) { await this.finishFailed(msg, "engine-unavailable", "app-server not running"); return }
     let threadId: string
     try {
@@ -1127,13 +1191,54 @@ class Seat implements SeatHandle {
     })
   }
 
+  /**
+   * 开跑前的规则闸：这条 thread 装着的 AGENTS 链过期了、而整台引擎空闲，就先换一代引擎再跑这一轮；
+   * 引擎上还有别的活就照旧规则跑，记下来空闲时补换。然后占住引擎（enginePins）直到这一轮收尾。
+   */
   private async runTurnLocked(msg: Incoming, threadId: string): Promise<void> {
+    let restarted = false
+    for (;;) {
+      while (this.engineMaintenance) await this.engineMaintenance
+      if (this.stopped) break
+      // 比的是这条 thread 装载时用的 cwd（codex 就是照它读的链），不是目标节点名义上的 cwd
+      const cwd = this.agentsFp.get(threadId)?.cwd ?? this.targetFor(msg.to)?.cwd ?? this.config.cwd
+      const changed = this.agentsChanged(threadId, cwd)
+      if (!changed) break
+      // 一轮最多换一代：文件还在被改，就先照这版跑，剩下的交给空闲时补换，绝不原地连环重启
+      if (restarted || !this.engineIdle()) {
+        if (!this.agentsReloadPending) this.log({ event: "agents-md-reload-deferred", threadId, changed, reason: restarted ? "changed-again" : "engine-busy" })
+        this.agentsReloadPending = { threadId, changed }
+        this.ensureAgentsTimer()
+        break
+      }
+      restarted = true
+      await this.restartEngineForAgents(threadId, changed, "turn")
+    }
+    // 不管是自己还是别的 thread 换的代：新引擎里没装着这条 thread 就先 resume
+    if (!this.stopped && !this.loadedThreads.has(threadId)) {
+      if (!this.engineUp) { await this.finishFailed(msg, "engine-unavailable", "app-server not running after restart"); return }
+      try {
+        const resumed = await this.ensureThreadFor(msg.to)
+        if (resumed !== threadId) { this.log({ event: "agents-md-thread-changed", threadId, resumed }); threadId = resumed }
+      } catch (err) {
+        await this.finishFailed(msg, "thread-start-failed", String(err))
+        return
+      }
+    }
+    this.enginePins++
+    try {
+      await this.runTurnPinned(msg, threadId)
+    } finally {
+      this.enginePins--
+    }
+  }
+
+  private async runTurnPinned(msg: Incoming, threadId: string): Promise<void> {
     if (this.stopped) { await this.finishFailed(msg, "shutdown", "seat stopped before turn submission"); return }
     const t0 = Date.now()
     let handle: TurnHandle
     const media = usableImages(msg.images)
     const refused = msg.imagesRefused ? `\n[图片未能作为原生输入（引擎拒绝：${shortDetail(msg.imagesRefused)}）；正文照常，图片路径见上文，可用工具读取。]` : ""
-    await this.reloadAgentsMdIfChanged(threadId, this.targetFor(msg.to)?.cwd ?? this.agentsFp.get(threadId)?.cwd ?? this.config.cwd)
     try {
       this.appendWal(this.walFor(msg, "submitting", { threadId }))
       this.markResumable(threadId)
@@ -1221,7 +1326,7 @@ class Seat implements SeatHandle {
         // A refused turn/start never ran, so retrying is side-effect free. Images must not cost the words.
         if (media.images.length && !msg.imagesRefused) {
           this.log({ event: "turn-images-refused", msgId: msg.msgId, images: media.images.length, code: outcome.code })
-          await this.runTurnLocked({ ...msg, images: undefined, imagesRefused: `${outcome.code}: ${outcome.message}` }, threadId)
+          await this.runTurnPinned({ ...msg, images: undefined, imagesRefused: `${outcome.code}: ${outcome.message}` }, threadId)
           return
         }
         await this.finishFailed(msg, "turn-start-failed", `${outcome.code}: ${outcome.message}`); return
@@ -1548,6 +1653,7 @@ class Seat implements SeatHandle {
     try {
       if (this.fault("fail-thread-start")) throw new Error("fault:fail-thread-start")
       const spawnFp = this.agentsFingerprint(ctl.cwd)
+      this.engineOps++
       const info = await this.engine.threadStart({
         cwd: ctl.cwd,
         developerInstructions: buildWorkerInstructions({
@@ -1555,7 +1661,7 @@ class Seat implements SeatHandle {
           delegatorNodeId: msg.from, seatNodeId: this.st.nodeId, desc: ctl.desc,
         }),
         config: this.configOverrideFor(predicted, msg.from),
-      })
+      }).finally(() => { this.engineOps-- })
       const reg = await this.mesh.register({
         shortId,
         role: "worker",
@@ -1627,7 +1733,10 @@ class Seat implements SeatHandle {
     if (!this.engineUp) { await this.finishFailed(m, "engine-unavailable", "app-server not running"); return }
     const threadId = nodeId === this.st.nodeId ? this.st.mainThreadId : this.st.workers[nodeId]?.threadId ?? null
     if (!threadId) { await this.finishFailed(m, "unknown-node", `node ${nodeId} has no thread`); return }
-    const out = await this.withThreadLock(threadId, () => this.engine.compact(threadId, this.config.turn.timeoutMs))
+    const out = await this.withThreadLock(threadId, async () => {
+      this.engineOps++
+      try { return await this.engine.compact(threadId, this.config.turn.timeoutMs) } finally { this.engineOps-- }
+    })
     if (out.ok) await this.sendDone(m, CTL_THREAD, `compacted ${threadId} in ${out.wallMs}ms`, Date.now() - t0)
     else await this.finishFailed(m, "internal", out.error ?? "compact failed")
   }
@@ -1784,6 +1893,7 @@ class Seat implements SeatHandle {
     this.log({ event: "seat-stop", reason })
 
     if (this.engineRetryTimer) clearTimeout(this.engineRetryTimer)
+    if (this.agentsTimer) { clearInterval(this.agentsTimer); this.agentsTimer = null }
     if (this.ledgerTimer) clearInterval(this.ledgerTimer)
     if (this.receiptTimer) clearInterval(this.receiptTimer)
     if (this.recoveryTimer) clearInterval(this.recoveryTimer)

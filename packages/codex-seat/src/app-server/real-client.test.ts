@@ -494,32 +494,3 @@ describe("RealAppServerClient：运维接口", () => {
     )
   })
 })
-
-describe("RealAppServerClient：重读 AGENTS 链", () => {
-  it("threadReloadProjectDocs 先把 cwd 弹去 bounce 再弹回原 cwd（两次 thread/settings/update，不起 turn）", async () => {
-    const t0 = Date.now()
-    const r = rig("reload", { turn: OK_TURN })
-    const c = client(r)
-    await c.start()
-    const th = await c.threadStart({ cwd: r.cwd, developerInstructions: "x", config: perThreadConfigOverride("e2edev:e2e-test") })
-    const out = await c.threadReloadProjectDocs(th.threadId, r.cwd, path.dirname(r.cwd))
-    assert.equal(out.opMs >= 0, true)
-    const calls = received(r, "thread/settings/update")
-    assert.deepEqual(calls.map((x) => x.params), [
-      { threadId: th.threadId, cwd: path.dirname(r.cwd) },
-      { threadId: th.threadId, cwd: r.cwd },
-    ], "必须先弹走再弹回，最后停在原 cwd")
-    assert.equal(received(r, "turn/start").length, 0, "重读不许顺手起 turn")
-    await c.stop()
-    console.log(`[reload] ${Date.now() - t0}ms settings/update=${calls.length}`)
-  })
-
-  it("弹回那一步失败要抛错并说明 cwd 可能停在 bounce（调用方据此不记新指纹）", async () => {
-    const r = rig("reload-fail", { turn: OK_TURN, failSettingsUpdate: { fromCall: 2, message: "nope" } })
-    const c = client(r)
-    await c.start()
-    const th = await c.threadStart({ cwd: r.cwd, developerInstructions: "x", config: perThreadConfigOverride("e2edev:e2e-test") })
-    await assert.rejects(() => c.threadReloadProjectDocs(th.threadId, r.cwd, "/tmp"), /可能停在 \/tmp/)
-    await c.stop()
-  })
-})

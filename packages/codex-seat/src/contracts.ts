@@ -970,12 +970,6 @@ export interface IAppServerClient {
   /** Read-only recovery of the original execution, including uncertain submission ACKs. */
   readTurn?(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown"; reason?: "not-found" | "read-error" }>
   turnInterrupt(threadId: string, turnId: string): Promise<void>
-  /**
-   * 让一条已装载的 thread 重读 AGENTS 链（下一轮生效），不重启进程、不打断别的 thread。
-   * 常驻 app-server 只在装载 thread 或 cwd 真变时读 AGENTS.md；实现是把 cwd 弹去 bounceCwd
-   * 再弹回 cwd（两次 thread/settings/update，中间不起 turn）。调用方保证这条 thread 当时没有 turn。
-   */
-  threadReloadProjectDocs?(threadId: string, cwd: string, bounceCwd: string): Promise<{ opMs: number }>
   compact(threadId: string, timeoutMs: number): Promise<CompactOutcome>
   loadedThreads(): Promise<string[]>
   rateLimits(): Promise<RateLimitsSnapshot>

@@ -521,22 +521,6 @@ export class RealAppServerClient implements IAppServerClient {
     await conn.request("turn/interrupt", { threadId, turnId }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS)
   }
 
-  /**
-   * 常驻引擎里的 thread 只在装载或 cwd 变化时读 AGENTS 链（0.153.4 实测：同 cwd 再设一次、
-   * thread/unsubscribe 都不会重读）。把 cwd 弹走再弹回，下一轮 world_state 就带上新的 agents_md。
-   * 弹回那一下失败要报错：调用方得知道这条 thread 的 cwd 可能停在了 bounceCwd。
-   */
-  async threadReloadProjectDocs(threadId: string, cwd: string, bounceCwd: string): Promise<{ opMs: number }> {
-    const conn = this.requireConn()
-    const t0 = this.now()
-    const timeout = this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS
-    const away = await conn.request("thread/settings/update", { threadId, cwd: bounceCwd }, timeout)
-    if (away.error) throw new Error(`thread/settings/update(cwd→${bounceCwd}) 失败: ${away.error.message}`)
-    const back = await conn.request("thread/settings/update", { threadId, cwd }, timeout)
-    if (back.error) throw new Error(`thread/settings/update(cwd→${cwd}) 失败，cwd 可能停在 ${bounceCwd}: ${back.error.message}`)
-    return { opMs: this.now() - t0 }
-  }
-
   async readTurn(threadId: string, turnId: string, msgId?: string): Promise<TurnOutcome | { status: "running"; turnId?: string } | { status: "unknown"; reason?: "not-found" | "read-error" }> {
     const r = await this.requireConn().request("thread/read", { threadId, includeTurns: true }, this.opts.threadOpTimeoutMs ?? THREAD_OP_TIMEOUT_MS)
     if (r.error) return { status: "unknown", reason: "read-error" }

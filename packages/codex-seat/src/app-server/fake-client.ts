@@ -69,7 +69,6 @@ export class FakeAppServerClient implements IAppServerClient {
   private readonly consumedScripts = new Set<number>()
   private readonly handlers = new Set<(ev: EngineEvent) => void>()
   private readonly emitted: EngineEvent[] = []
-  private readonly reloads: Array<{ threadId: string; cwd: string; bounceCwd: string }> = []
 
   constructor(opts: FakeAppServerClientOptions = {}) {
     this.scenario = parseScenario(opts.scenario ?? {})
@@ -89,10 +88,6 @@ export class FakeAppServerClient implements IAppServerClient {
   }
   scenarioSnapshot(): FakeScenario {
     return this.scenario
-  }
-  /** threadReloadProjectDocs 的调用记录 */
-  reloadCalls(): ReadonlyArray<{ threadId: string; cwd: string; bounceCwd: string }> {
-    return this.reloads
   }
 
   // ---- 生命周期 -----------------------------------------------------------
@@ -152,14 +147,6 @@ export class FakeAppServerClient implements IAppServerClient {
     await this.delay(this.scenario.threadResumeMs)
     this.threads.set(req.threadId, { cwd: req.cwd, config: req.config })
     return { threadId: req.threadId, cwd: req.cwd, model: "fake-model", resumed: true, opMs: this.scenario.threadResumeMs }
-  }
-
-  async threadReloadProjectDocs(threadId: string, cwd: string, bounceCwd: string): Promise<{ opMs: number }> {
-    this.requireAlive()
-    if (!this.threads.has(threadId)) throw new Error(`thread not loaded: ${threadId}`)
-    this.reloads.push({ threadId, cwd, bounceCwd })
-    this.threads.set(threadId, { ...this.threads.get(threadId)!, cwd })
-    return { opMs: 0 }
   }
 
   async loadedThreads(): Promise<string[]> {

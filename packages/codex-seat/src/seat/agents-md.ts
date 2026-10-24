@@ -3,8 +3,9 @@
  *
  * 为什么要有它（2026-10-24 实测，codex-cli 0.153.4 / 0.154.0，P62 t_4ea2a3）：
  * 常驻 app-server 只在 thread **装进进程**（thread/start、进程重启后的 thread/resume）
- * 或 **thread 的 cwd 真的变了**时读 AGENTS 链；同一进程里一轮接一轮跑，磁盘上的
+ * 或**这一轮的 cwd 和上一轮不同**时读 AGENTS 链；同一进程里一轮接一轮跑，磁盘上的
  * AGENTS.md 改了它也照用旧的（压缩后整份重发的 world_state 也还是旧文本）。
+ * 两轮之间把 cwd 弹走再弹回、thread/unsubscribe 都不会让它重读，唯一干净的办法是换一代引擎再 resume。
  * 席位常驻几天不重启，规则就几天不生效（Mini codex-feishu 10-21→10-24）。
  *
  * 读链规则照 codex 的做法取近似、宁多勿漏（多算只会多刷新一次，没有副作用）：
@@ -98,10 +99,4 @@ export function agentsChainFingerprint(cwd: string, codexHome: string): AgentsCh
     if (hit) add(hit.path, hit)
   }
   return { hash: h.digest("hex").slice(0, 16), files }
-}
-
-/** 刷新时 cwd 临时弹去的目录：父目录（存在、与 cwd 不同）；cwd 已是根就用系统临时目录。 */
-export function bounceDirFor(cwd: string): string {
-  const parent = path.dirname(cwd)
-  return parent !== cwd ? parent : os.tmpdir()
 }
