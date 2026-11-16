@@ -406,18 +406,11 @@ export function createServer(opts: ServerOptions): MeshServer {
   })
 
   // ===== Unregister =====
-  app.delete("/api/register", async (_req: Request, res: Response) => {
-    const removedNodeIds = registry.getAll().map((node) => node.identity.nodeId)
-    for (const nodeId of removedNodeIds) {
-      registry.unregister(nodeId)
-      store.removeNode(nodeId)
-      wake.forget(nodeId)
-      events?.emit("node:unregister", { nodeId })
-    }
-    if (uplink?.isConnected()) {
-      await uplink.sendRegistration([])
-    }
-    res.json({ ok: true, data: { removedNodeIds } })
+  app.delete("/api/register", (_req: Request, res: Response) => {
+    res.status(400).json({
+      ok: false,
+      error: "bare DELETE /api/register is disabled; delete nodes by nodeId",
+    })
   })
 
   app.delete("/api/register/:nodeId", async (req: Request, res: Response) => {
