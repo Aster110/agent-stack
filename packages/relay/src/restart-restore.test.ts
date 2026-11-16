@@ -325,18 +325,41 @@ describe("relay 重启 — 注册表从 SQLite 恢复", () => {
     }
   })
 
-  it("全量 unregister 后重启，注册表是空的", async () => {
+  it("逐个 unregister 后重启，注册表是空的", async () => {
     const db = tmpDb("unregall")
     const a = await boot(db)
-    await registerPull(a.base, "cc-a")
-    await registerInject(a.base, "cc-b")
-    await httpDelete(a.base, "/api/register")
+    const first = await registerPull(a.base, "cc-a")
+    const second = await registerInject(a.base, "cc-b")
+    await httpDelete(a.base, `/api/register/${encodeURIComponent(first)}`)
+    await httpDelete(a.base, `/api/register/${encodeURIComponent(second)}`)
     await a.halt()
 
     const b = await boot(db)
     try {
       assert.equal(b.app.restoredNodeCount, 0)
       assert.equal((await httpGet(b.base, "/api/status")).data.data.nodes.length, 0)
+    } finally {
+      await b.halt(); rmDb(db)
+    }
+  })
+
+  it("裸 DELETE 被拒绝后，重启仍恢复全部节点", async () => {
+    const db = tmpDb("unregall-guard")
+    const a = await boot(db)
+    const first = await registerPull(a.base, "cc-guard-a")
+    const second = await registerInject(a.base, "cc-guard-b")
+    const rejected = await httpDelete(a.base, "/api/register")
+    assert.equal(rejected.status, 400)
+    await a.halt()
+
+    const b = await boot(db)
+    try {
+      assert.equal(b.app.restoredNodeCount, 2)
+      const nodes = (await httpGet(b.base, "/api/status")).data.data.nodes
+      assert.deepEqual(
+        nodes.map((node: any) => node.identity.nodeId).sort(),
+        [first, second].sort(),
+      )
     } finally {
       await b.halt(); rmDb(db)
     }

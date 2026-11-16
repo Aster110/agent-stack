@@ -264,7 +264,7 @@ describe("Server — HTTP API 集成测试（向后兼容：无 transport）", (
   })
 
   describe("DELETE /api/register", () => {
-    it("清空所有注册节点", async () => {
+    it("拒绝裸 DELETE，且不清空注册节点", async () => {
       await api("POST", "/register", {
         shortId: "cc-clear1",
         sessionId: "sess-clear1",
@@ -281,14 +281,12 @@ describe("Server — HTTP API 集成测试（向后兼容：无 transport）", (
       })
 
       const { status, data } = await api("DELETE", "/register")
-      assert.equal(status, 200)
-      assert.equal(data.ok, true)
-      assert.ok(data.data.removedNodeIds.includes("macbook:cc-clear1"))
-      assert.ok(data.data.removedNodeIds.includes("macbook:cc-clear2"))
+      assert.equal(status, 400)
+      assert.equal(data.ok, false)
 
       const after = await api("GET", "/status")
-      assert.ok(!after.data.data.nodes.some((n: any) => n.identity.shortId === "cc-clear1"))
-      assert.ok(!after.data.data.nodes.some((n: any) => n.identity.shortId === "cc-clear2"))
+      assert.ok(after.data.data.nodes.some((n: any) => n.identity.shortId === "cc-clear1"))
+      assert.ok(after.data.data.nodes.some((n: any) => n.identity.shortId === "cc-clear2"))
     })
   })
 
@@ -1144,7 +1142,7 @@ describe("Server — Phase 2.0 Transport 注入", () => {
     }
   })
 
-  it("DELETE /api/register 清空后调用 uplink.sendRegistration([])", async () => {
+  it("裸 DELETE /api/register 被拒绝且不调用 uplink.sendRegistration", async () => {
     const db2 = path.join(os.tmpdir(), `mesh-hub-sync-clear-${Date.now()}.db`)
     const term2 = new MockTerminal()
     const tr2 = new MockTransport()
@@ -1177,9 +1175,8 @@ describe("Server — Phase 2.0 Transport 注入", () => {
       const beforeClear = sendRegistrationLog.length
 
       const del = await fetch(`${u2}/register`, { method: "DELETE" })
-      assert.equal(del.status, 200)
-      assert.equal(sendRegistrationLog.length, beforeClear + 1, "清空后应调用一次 sendRegistration")
-      assert.deepEqual(sendRegistrationLog[sendRegistrationLog.length - 1], [])
+      assert.equal(del.status, 400)
+      assert.equal(sendRegistrationLog.length, beforeClear, "拒绝裸 DELETE 后不应调用 sendRegistration")
     } finally {
       await new Promise<void>((r) => s2.close(() => r()))
       try { fs.unlinkSync(db2) } catch {}
