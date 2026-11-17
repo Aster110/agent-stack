@@ -1,6 +1,6 @@
 import Database from "better-sqlite3"
 import type { MeshMessage, MessageStatus, LocalNode } from "@cc-mesh/protocol"
-import { now, normalizeDeliveryMode } from "@cc-mesh/protocol"
+import { now, normalizeDeliveryMode, LEDGER_SINK } from "@cc-mesh/protocol"
 import path from "node:path"
 import fs from "node:fs"
 
@@ -12,8 +12,22 @@ import type { MessagePriority } from "@cc-mesh/protocol"
 // getInbox 返回的行——在 MeshMessage 之上带 priority（协议类型不动，priority 是 relay 本地关注点）。
 export type StoredMessage = MeshMessage & { priority: MessagePriority }
 
-// getMessagesSinceSeq 返回的行——账本同步要的三样全带齐：正文 + 落库时的 status/priority + 本机 seq。
+// getLedgerRowsSinceSeq 返回的行——账本同步要的三样全带齐：正文 + 落库时的 status/priority + 本机 seq。
 export type LedgerRow = MeshMessage & { priority: MessagePriority; status: MessageStatus; seq: number }
+
+/**
+ * 机器体检上报（quota_report / screen_report / wake_audit …）：发给云端账本 @ledger 的流水，不是消息。
+ * 存 reports 表，不进 messages：不路由、不投递、不进任何收件箱 / 门铃 / 唤醒对账。
+ */
+export interface ReportInput {
+  id: string
+  from: string
+  type: string
+  payload: string
+  replyTo?: string
+  meta?: Record<string, unknown>
+  createdAt: string
+}
 
 /** meta → TEXT 列：undefined/null 存 NULL（不存字符串 "null"）；不可序列化对象降级 NULL，不让写库爆。 */
 function serializeMeta(meta: MeshMessage["meta"]): string | null {
@@ -89,6 +103,20 @@ export class Store {
 
       CREATE INDEX IF NOT EXISTS idx_messages_to ON messages("to");
       CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status);
+
+      -- 机器体检上报（发给 @ledger 的流水）：与 messages 分开存，共用同一个单调 seq 计数，
+      -- 由 LedgerSync 两表按 seq 合并上云（Hub 看到的仍是 to='@ledger' 的 message 事件）。
+      CREATE TABLE IF NOT EXISTS reports (
+        id TEXT PRIMARY KEY,
+        "from" TEXT NOT NULL,
+        type TEXT NOT NULL,
+        payload TEXT,
+        reply_to TEXT,
+        meta TEXT,
+        created_at TEXT NOT NULL,
+        seq INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_reports_seq ON reports(seq);
     `)
 
     // 增量列迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的老表加列，
@@ -112,6 +140,8 @@ export class Store {
     // 按 created_at + rowid 顺序回填单调 seq（一次性，幂等：只填 NULL 行）。
     this.backfillSeq()
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_seq ON messages(seq);`)
+    // 一次性迁移（幂等）：messages 里已有的 @ledger 行搬进 reports（seq 原样保留）。
+    this.moveLedgerRowsToReports()
     // 启动自检：把「不可能游标」喊出来。只报不改——理由见 getAckCursor 注释。
     // 这是本次事故唯一真正缺的东西：坏了 5 天，全程零报错、零日志。
     for (const c of this.findImpossibleCursors()) {
@@ -123,11 +153,48 @@ export class Store {
     }
   }
 
+  /**
+   * 把 messages 里的 @ledger 行搬进 reports，seq 原样保留（账本游标已经上行过的不会重发，没上行的照样会发）。
+   *
+   * 唯一例外是 messages 的 head 行（seq = MAX(seq)）：它恰好是上报也留在原地——
+   * messages 的 head 是 ack 游标的物理上界（见 headSeq），搬走会让上界回退。
+   * 下次启动它不再是 head 时照常搬走。重复跑无副作用。
+   */
+  private moveLedgerRowsToReports(): number {
+    const head = this.headSeq()
+    const move = this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO reports (id, "from", type, payload, reply_to, meta, created_at, seq)
+        SELECT id, "from", type, payload, reply_to, meta, created_at, seq FROM messages
+        WHERE "to" = ? AND seq IS NOT NULL AND seq < ?
+      `).run(LEDGER_SINK, head)
+      return this.db.prepare(`
+        DELETE FROM messages WHERE "to" = ? AND seq IS NOT NULL AND seq < ? AND id IN (SELECT id FROM reports)
+      `).run(LEDGER_SINK, head).changes
+    })
+    return move() as number
+  }
+
+  /**
+   * 下一个 seq：messages 与 reports 共用一个单调计数（取两表 MAX(seq)+1）。
+   * 账本游标只有一个，两表的行按 seq 合并上行，所以 seq 必须全局单调、互不重叠。
+   */
+  private nextSeq(): number {
+    const row = this.db.prepare(`
+      SELECT MAX(m) AS m FROM (
+        SELECT COALESCE(MAX(seq), 0) AS m FROM messages
+        UNION ALL
+        SELECT COALESCE(MAX(seq), 0) AS m FROM reports
+      )
+    `).get() as any
+    return ((row?.m as number) ?? 0) + 1
+  }
+
   /** 回填老消息的 seq（NULL → 按 rowid 顺序赋单调值），保证游标可达。 */
   private backfillSeq(): void {
     const nullCount = (this.db.prepare("SELECT COUNT(*) AS c FROM messages WHERE seq IS NULL").get() as any).c as number
     if (nullCount === 0) return
-    const base = (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM messages").get() as any).m as number
+    const base = this.nextSeq() - 1
     // 按 rowid 升序（= 物理插入顺序）回填，从 base+1 起递增
     const rows = this.db.prepare("SELECT rowid FROM messages WHERE seq IS NULL ORDER BY rowid ASC").all() as Array<{ rowid: number }>
     const upd = this.db.prepare("UPDATE messages SET seq = ? WHERE rowid = ?")
@@ -152,9 +219,9 @@ export class Store {
 
   saveMessage(msg: MeshMessage, status: MessageStatus = "submitted", priority: MessagePriority = "normal"): void {
     // 单调自增 seq：id 是 TEXT PRIMARY KEY 不能用 AUTOINCREMENT，
-    // 用 MAX(seq)+1 赋值（单机 better-sqlite3 同步执行，无并发竞态）。
+    // 用两表 MAX(seq)+1 赋值（单机 better-sqlite3 同步执行，无并发竞态）。
     // INSERT OR REPLACE 同 id 也走这条 → seq 只增不退，不破坏游标单调性。
-    const nextSeq = ((this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM messages").get() as any).m as number) + 1
+    const nextSeq = this.nextSeq()
     this.db.prepare(`
       INSERT OR REPLACE INTO messages (id, "from", "to", type, payload, reply_to, status, created_at, seq, acked, priority, meta)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
@@ -167,7 +234,7 @@ export class Store {
    * 返回是否新插入（true=新行，false=已存在被忽略）。
    */
   saveMessageIfAbsent(msg: MeshMessage, status: MessageStatus = "submitted", priority: MessagePriority = "normal"): boolean {
-    const nextSeq = ((this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM messages").get() as any).m as number) + 1
+    const nextSeq = this.nextSeq()
     const info = this.db.prepare(`
       INSERT OR IGNORE INTO messages (id, "from", "to", type, payload, reply_to, status, created_at, seq, acked, priority, meta)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
@@ -175,20 +242,37 @@ export class Store {
     return info.changes > 0
   }
 
+  // ===== Reports（机器体检上报，发给 @ledger 的流水）=====
+
+  /** 落一条上报（id 幂等）。返回是否新插入。 */
+  saveReport(r: ReportInput): boolean {
+    const info = this.db.prepare(`
+      INSERT OR IGNORE INTO reports (id, "from", type, payload, reply_to, meta, created_at, seq)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(r.id, r.from, r.type, r.payload, r.replyTo ?? null, serializeMeta(r.meta), r.createdAt, this.nextSeq())
+    return info.changes > 0
+  }
+
   /**
-   * 游标取数口（LedgerSync 专用）：WHERE seq > since ORDER BY seq ASC LIMIT n。
-   * 与 getInbox 的区别：不按收件人过滤——账本要的是本机全量流水（含 @ledger 哨兵行、广播行）。
+   * 游标取数口（LedgerSync 专用）：messages 与 reports 两表按 seq 合并，WHERE seq > since ORDER BY seq ASC LIMIT n。
+   * 与 getInbox 的区别：不按收件人过滤——账本要的是本机全量流水（含广播行与上报）。
+   * 上报行按原来的 message 事件形状上云：to='@ledger'、status='delivered'、priority='normal'。
    * priority 旧行 NULL → COALESCE 'normal'；replyTo/meta 为空一律 undefined（上账本的 JSON 不带 null 噪音）。
    */
-  getMessagesSinceSeq(since: number, limit: number): LedgerRow[] {
+  getLedgerRowsSinceSeq(since: number, limit: number): LedgerRow[] {
     const rows = this.db.prepare(`
-      SELECT id, "from", "to", type, payload, reply_to as replyTo, created_at as createdAt, seq, status,
-             COALESCE(priority, 'normal') as priority, meta
-      FROM messages
-      WHERE seq > ?
+      SELECT * FROM (
+        SELECT id, "from", "to", type, payload, reply_to as replyTo, created_at as createdAt, seq, status,
+               COALESCE(priority, 'normal') as priority, meta
+        FROM messages WHERE seq > ?
+        UNION ALL
+        SELECT id, "from", ? as "to", type, payload, reply_to as replyTo, created_at as createdAt, seq, 'delivered' as status,
+               'normal' as priority, meta
+        FROM reports WHERE seq > ?
+      )
       ORDER BY seq ASC
       LIMIT ?
-    `).all(since, limit) as any[]
+    `).all(since, LEDGER_SINK, since, limit) as any[]
     return rows.map((r) => {
       const row: LedgerRow = {
         id: r.id,
@@ -245,12 +329,12 @@ export class Store {
   // ===== Ack 游标（per-node，单调推进） =====
 
   /**
-   * 当前最大 seq —— 游标的**物理上界**（空库为 0）。
+   * messages 当前最大 seq —— ack 游标的**物理上界**（空库为 0）。只看 messages：上报行不进任何收件箱。
    *
-   * 为什么它就是上界：seq 一律由本机 `MAX(seq)+1` 赋值（saveMessage 与下行
+   * 为什么它就是上界：seq 一律由本机两表 `MAX(seq)+1` 赋值（saveMessage 与下行
    * INSERT OR IGNORE 两条入库路径都是，见上文），消息必须先拿到 seq 才可能被投递。
-   * 所以任何**真实**回执的 upToSeq 必然 ≤ 当时的 head。生产代码不删 messages 行，
-   * head 单调不减。
+   * 所以任何**真实**回执的 upToSeq 必然 ≤ 当时的 head。生产代码不删 messages 行
+   * （启动迁移搬走 @ledger 行时也永不搬 head 行），head 单调不减。
    */
   headSeq(): number {
     return (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM messages").get() as any).m as number

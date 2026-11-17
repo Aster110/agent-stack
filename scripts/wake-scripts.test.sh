@@ -242,9 +242,13 @@ rc=$?
 sleep 6
 grep -q '|| red' "$ALERTS" && ok "席位仍冷 → verdict=d 红卡" || bad "没发 verdict=d 红卡（$(cat "$ALERTS")）"
 
-# @ledger 审计流水（/api/inbox 只读、无 touchSync 副作用，旁观者可安全查）
+# @ledger 审计流水：作为上报落 relay 本地 reports 表（不进 messages、不进任何收件箱），只读打开沙箱库查
 LEDGER="$SANDBOX/ledger.json"
-curl -sS --noproxy '*' -m 5 -G "${RELAY_URL}/api/inbox" --data-urlencode "nodeId=@ledger" > "$LEDGER" 2>/dev/null
+node -e '
+  const Database = require(process.argv[1])
+  const db = new Database(process.argv[2], { readonly: true })
+  process.stdout.write(JSON.stringify(db.prepare("SELECT id, \"from\", type, payload FROM reports ORDER BY seq").all()))
+' "$ROOT/packages/relay/node_modules/better-sqlite3" "$DB" > "$LEDGER" 2>/dev/null
 grep -q "test-wake-id-123" "$LEDGER" \
   && ok "hook 的 verdict 写进 @ledger 流水（wake_id 串得起因果链）" \
   || bad "@ledger 里没有 hook 的审计行"

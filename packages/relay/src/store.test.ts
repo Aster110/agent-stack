@@ -679,7 +679,7 @@ describe("Store — saveMessageIfAbsent 幂等落库（PR1 downlink）", () => {
   })
 })
 
-// ===== 云端账本 M1：meta 列 + getMessagesSinceSeq（LedgerSync 取数口）=====
+// ===== 云端账本 M1：meta 列 + getLedgerRowsSinceSeq（LedgerSync 取数口）=====
 describe("Store — meta 列（结构化元数据）", () => {
   let store: Store
   let dbPath: string
@@ -695,10 +695,10 @@ describe("Store — meta 列（结构化元数据）", () => {
     try { fs.unlinkSync(dbPath + "-shm") } catch {}
   })
 
-  it("saveMessage 持久化 meta（JSON），getMessagesSinceSeq 解析回对象", () => {
+  it("saveMessage 持久化 meta（JSON），getLedgerRowsSinceSeq 解析回对象", () => {
     const msg = makeMsg({ id: "msg-meta-1", to: "node-meta", meta: { _task: { title: "跑测试", pickReason: "explicit" } } })
     store.saveMessage(msg)
-    const rows = store.getMessagesSinceSeq(0, 100).filter((r) => r.id === "msg-meta-1")
+    const rows = store.getLedgerRowsSinceSeq(0, 100).filter((r) => r.id === "msg-meta-1")
     assert.equal(rows.length, 1)
     assert.deepEqual(rows[0].meta, { _task: { title: "跑测试", pickReason: "explicit" } })
   })
@@ -710,14 +710,14 @@ describe("Store — meta 列（结构化元数据）", () => {
     const row = raw.prepare("SELECT meta FROM messages WHERE id = ?").get("msg-meta-2") as any
     raw.close()
     assert.equal(row.meta, null, "undefined meta 应落 NULL")
-    const parsed = store.getMessagesSinceSeq(0, 100).find((r) => r.id === "msg-meta-2")!
+    const parsed = store.getLedgerRowsSinceSeq(0, 100).find((r) => r.id === "msg-meta-2")!
     assert.equal(parsed.meta, undefined)
   })
 
   it("saveMessageIfAbsent 也持久化 meta", () => {
     const msg = makeMsg({ id: "msg-meta-3", to: "node-meta", meta: { src: "downlink" } })
     store.saveMessageIfAbsent(msg)
-    const row = store.getMessagesSinceSeq(0, 100).find((r) => r.id === "msg-meta-3")!
+    const row = store.getLedgerRowsSinceSeq(0, 100).find((r) => r.id === "msg-meta-3")!
     assert.deepEqual(row.meta, { src: "downlink" })
   })
 
@@ -728,13 +728,13 @@ describe("Store — meta 列（结构化元数据）", () => {
                  VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, 0, ?)`)
       .run("msg-meta-bad", "macbook:cc-x", "node-meta", "chat", "x", new Date().toISOString(), seq, "{不是JSON")
     raw.close()
-    const row = store.getMessagesSinceSeq(0, 200).find((r) => r.id === "msg-meta-bad")!
+    const row = store.getLedgerRowsSinceSeq(0, 200).find((r) => r.id === "msg-meta-bad")!
     assert.ok(row, "坏 meta 行仍应被取到")
     assert.equal(row.meta, undefined)
   })
 })
 
-describe("Store — getMessagesSinceSeq（游标取数）", () => {
+describe("Store — getLedgerRowsSinceSeq（游标取数）", () => {
   let store: Store
   let dbPath: string
 
@@ -753,7 +753,7 @@ describe("Store — getMessagesSinceSeq（游标取数）", () => {
     store.saveMessage(makeMsg({ id: "sq-1", to: "node-A" }))
     store.saveMessage(makeMsg({ id: "sq-2", to: "@ledger" }))
     store.saveMessage(makeMsg({ id: "sq-3", to: "*" }))
-    const rows = store.getMessagesSinceSeq(0, 100)
+    const rows = store.getLedgerRowsSinceSeq(0, 100)
     assert.deepEqual(rows.map((r) => r.id), ["sq-1", "sq-2", "sq-3"])
     for (let i = 1; i < rows.length; i++) {
       assert.ok(rows[i].seq > rows[i - 1].seq, "seq 必须严格升序")
@@ -761,29 +761,122 @@ describe("Store — getMessagesSinceSeq（游标取数）", () => {
   })
 
   it("since 是开区间（seq > since），limit 截断", () => {
-    const all = store.getMessagesSinceSeq(0, 100)
+    const all = store.getLedgerRowsSinceSeq(0, 100)
     const firstSeq = all[0].seq
-    const after = store.getMessagesSinceSeq(firstSeq, 100)
+    const after = store.getLedgerRowsSinceSeq(firstSeq, 100)
     assert.equal(after.length, all.length - 1)
     assert.equal(after[0].id, "sq-2")
-    assert.equal(store.getMessagesSinceSeq(0, 2).length, 2, "limit 生效")
+    assert.equal(store.getLedgerRowsSinceSeq(0, 2).length, 2, "limit 生效")
   })
 
   it("返回行带 status / priority（旧行 NULL → normal）/ replyTo", () => {
     store.saveMessage(makeMsg({ id: "sq-4", to: "node-B", replyTo: "sq-1" }), "delivered", "urgent")
-    const row = store.getMessagesSinceSeq(0, 100).find((r) => r.id === "sq-4")!
+    const row = store.getLedgerRowsSinceSeq(0, 100).find((r) => r.id === "sq-4")!
     assert.equal(row.status, "delivered")
     assert.equal(row.priority, "urgent")
     assert.equal(row.replyTo, "sq-1")
-    const noReply = store.getMessagesSinceSeq(0, 100).find((r) => r.id === "sq-1")!
+    const noReply = store.getLedgerRowsSinceSeq(0, 100).find((r) => r.id === "sq-1")!
     assert.equal(noReply.replyTo, undefined, "无 replyTo 应是 undefined 不是 null")
     assert.equal(noReply.priority, "normal")
   })
 
   it("游标追平后返回空数组", () => {
-    const all = store.getMessagesSinceSeq(0, 1000)
+    const all = store.getLedgerRowsSinceSeq(0, 1000)
     const maxSeq = all[all.length - 1].seq
-    assert.deepEqual(store.getMessagesSinceSeq(maxSeq, 1000), [])
+    assert.deepEqual(store.getLedgerRowsSinceSeq(maxSeq, 1000), [])
+  })
+})
+
+// ===== reports：机器体检上报与 messages 分表、共用一个 seq =====
+describe("Store — reports（上报分表，共用 seq）", () => {
+  const report = (id: string, type = "screen_report") =>
+    ({ id, from: "macbook:relay", type, payload: `p-${id}`, createdAt: new Date().toISOString() })
+  /** 另开一条只读连接看表里实况（WAL 下读得到已提交的写）。 */
+  const seqOf = (dbPath: string, table: "messages" | "reports", id: string): number | undefined => {
+    const raw = new Database(dbPath, { readonly: true })
+    try {
+      return (raw.prepare(`SELECT seq FROM ${table} WHERE id = ?`).get(id) as any)?.seq as number | undefined
+    } finally {
+      raw.close()
+    }
+  }
+  const cleanup = (dbPath: string) => {
+    for (const ext of ["", "-wal", "-shm"]) { try { fs.unlinkSync(dbPath + ext) } catch {} }
+  }
+
+  it("上报与消息共用单调 seq；两表按 seq 合并取数；上报行以 to=@ledger / delivered / normal 给出", () => {
+    const dbPath = tmpDb()
+    const store = new Store(dbPath)
+    try {
+      store.saveMessage(makeMsg({ id: "m-1", to: "macbook:cc-a" }))
+      store.saveReport(report("r-2"))
+      store.saveMessage(makeMsg({ id: "m-3", to: "macbook:cc-a" }))
+      store.saveReport(report("r-4"))
+      assert.equal(store.saveMessageIfAbsent(makeMsg({ id: "m-5", to: "macbook:cc-a" })), true)
+      const rows = store.getLedgerRowsSinceSeq(0, 100)
+      assert.deepEqual(rows.map((r) => r.id), ["m-1", "r-2", "m-3", "r-4", "m-5"])
+      assert.deepEqual(rows.map((r) => r.seq), [1, 2, 3, 4, 5], "两表不重号、不回退（下行着陆也跨两表取号）")
+      const r2 = rows[1]!
+      assert.equal(r2.to, "@ledger")
+      assert.equal(r2.from, "macbook:relay")
+      assert.equal(r2.status, "delivered")
+      assert.equal(r2.priority, "normal")
+      assert.equal(r2.payload, "p-r-2")
+      assert.equal(seqOf(dbPath, "messages", "r-2"), undefined, "上报不进 messages")
+      store.saveReport(report("r-6"))
+      assert.equal(store.headSeq(), 5, "headSeq 只看 messages（ack 游标的上界）")
+      assert.deepEqual(store.getInbox("macbook:cc-a").map((m) => m.id), ["m-1", "m-3", "m-5"], "上报不进收件箱")
+      assert.equal(store.saveReport(report("r-4")), false, "同 id 幂等")
+      assert.equal(store.getLedgerRowsSinceSeq(0, 100).length, 6)
+    } finally {
+      store.close()
+      cleanup(dbPath)
+    }
+  })
+
+  it("启动迁移：messages 里已有的 @ledger 行搬进 reports（seq 原样），head 行恰是上报就留着；重复启动幂等", () => {
+    const dbPath = tmpDb()
+    let store = new Store(dbPath)
+    try {
+      // 老 relay 写下的流水：上报和消息混在 messages 里，最后一行（head）恰好是上报
+      store.saveMessage(makeMsg({ id: "old-q1", to: "@ledger", type: "quota_report" as any }), "delivered")
+      store.saveMessage(makeMsg({ id: "old-m2", to: "macbook:cc-a" }))
+      store.saveMessage(makeMsg({ id: "old-s3", to: "@ledger", type: "wake_audit" as any }), "delivered")
+      store.saveMessage(makeMsg({ id: "old-s4", to: "@ledger", type: "wake_audit" as any }), "delivered")
+      store.ack("macbook:cc-a", 4)
+      const before = store.getLedgerRowsSinceSeq(0, 100).map((r) => [r.id, r.seq, r.to, r.status])
+      store.close()
+
+      store = new Store(dbPath)
+      assert.deepEqual(
+        store.getLedgerRowsSinceSeq(0, 100).map((r) => [r.id, r.seq, r.to, r.status]), before,
+        "上行流水一条不多一条不少、seq 不变",
+      )
+      assert.equal(seqOf(dbPath, "reports", "old-q1"), 1)
+      assert.equal(seqOf(dbPath, "reports", "old-s3"), 3)
+      assert.equal(seqOf(dbPath, "messages", "old-q1"), undefined)
+      assert.equal(seqOf(dbPath, "messages", "old-s3"), undefined)
+      assert.equal(seqOf(dbPath, "messages", "old-m2"), 2, "普通消息不动")
+      assert.equal(seqOf(dbPath, "messages", "old-s4"), 4, "messages 的 head 行不搬（ack 游标上界不回退）")
+      assert.equal(seqOf(dbPath, "reports", "old-s4"), undefined)
+      assert.equal(store.headSeq(), 4)
+      assert.deepEqual(store.findImpossibleCursors(), [], "迁移后 ack 游标仍 ≤ head")
+      store.close()
+
+      store = new Store(dbPath)
+      assert.deepEqual(store.getLedgerRowsSinceSeq(0, 100).map((r) => [r.id, r.seq, r.to, r.status]), before, "幂等")
+      store.saveMessage(makeMsg({ id: "new-m5", to: "macbook:cc-a" }))
+      assert.equal(seqOf(dbPath, "messages", "new-m5"), 5)
+      store.close()
+
+      store = new Store(dbPath)
+      assert.equal(seqOf(dbPath, "reports", "old-s4"), 4, "不再是 head 后下次启动照常搬走")
+      assert.equal(seqOf(dbPath, "messages", "old-s4"), undefined)
+      assert.deepEqual(store.getLedgerRowsSinceSeq(0, 100).map((r) => r.id), ["old-q1", "old-m2", "old-s3", "old-s4", "new-m5"])
+    } finally {
+      store.close()
+      cleanup(dbPath)
+    }
   })
 })
 

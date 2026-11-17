@@ -250,7 +250,7 @@ describe("deliverDownlinkMessage — 跨机原件同一性", () => {
       "[mesh:computer1:cc-brain] 把 M2 跨机链路验通",
       "注入正文 = [mesh:原发送方] + 原文",
     )
-    const row = store.getMessagesSinceSeq(0, 10).find((x) => x.id === m.id)!
+    const row = store.getLedgerRowsSinceSeq(0, 10).find((x) => x.id === m.id)!
     assert.equal(row.payload, "把 M2 跨机链路验通", "落库的是原文，不是注入用的带前缀文本")
     assert.equal(row.type, "task")
     store.close()
@@ -267,7 +267,7 @@ describe("deliverDownlinkMessage — 跨机原件同一性", () => {
     await deliverDownlinkMessage({ msg: m, registry, terminal: term, saveMessage: (mm) => store.saveMessageIfAbsent(mm) })
     await deliverDownlinkMessage({ msg: m, registry, terminal: term, saveMessage: (mm) => store.saveMessageIfAbsent(mm) })
 
-    const rows = store.getMessagesSinceSeq(0, 10).filter((x) => x.id === m.id)
+    const rows = store.getLedgerRowsSinceSeq(0, 10).filter((x) => x.id === m.id)
     assert.equal(rows.length, 1)
     assert.equal(rows[0].type, "task")
     store.close()

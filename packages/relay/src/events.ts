@@ -7,6 +7,7 @@
  *   msg:send         { msgId, from, to, status }
  *   msg:delivered    { msgId: string }
  *   uplink:status    { connected: boolean, hubUrl?: string }
+ *   report:saved     { id, from, type }   机器体检上报落库（不是消息，不进收件箱）
  *   wake:needed      { nodeId, parkedCount }
  *
  * 监听器抛异常不影响同事件的其他监听器。
@@ -19,6 +20,7 @@ export type MeshEventMap = {
   "msg:send": { msgId: string; from: string; to: string; status: string }
   "msg:delivered": { msgId: string }
   "uplink:status": { connected: boolean; hubUrl?: string }
+  "report:saved": { id: string; from: string; type: string }
   /**
    * 有消息投给了一个没人接货的 pull 节点——该把它叫醒了。
    * parkedCount 是**判定当时**的采样值（正常就是 0），用于排障时看清是不是误判。

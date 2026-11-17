@@ -4,6 +4,7 @@
  *
  * 语义三句话：
  *  1. 本地 mesh.db 是一级真相，也是发送队列——离线不丢，靠游标续传（不另建 outbox 表）。
+ *     messages 与 reports（机器体检上报）共用一个单调 seq，两表按 seq 合并上行，一个游标管两表。
  *  2. 只有收到 Hub 的 `ledger_ack {upToSeq}` 才推进游标；没 ack 就下轮重发同批
  *     （Hub 侧按 msg.id `INSERT OR IGNORE` 幂等，重发不产生重复行）。
  *  3. uplink 断开时本轮直接跳过——不缓存、不重试队列，重连后照样从游标续。
@@ -24,7 +25,7 @@ const CURSOR_UPDATED_BY = "ledger-sync"
 
 /** LedgerSync 只需要 Store 的这三个口（窄接口，测试可注假）。 */
 export interface LedgerSyncStore {
-  getMessagesSinceSeq(since: number, limit: number): LedgerRow[]
+  getLedgerRowsSinceSeq(since: number, limit: number): LedgerRow[]
   kvGet(key: string): { value: string } | undefined
   kvSet(key: string, value: string, updatedBy: string): void
 }
@@ -119,7 +120,7 @@ export class LedgerSync {
     // 断连本轮跳过——本地库就是队列，重连后从游标续，一条不丢。
     if (!this.uplink.isConnected()) return 0
     const since = this.cursor()
-    const rows = this.store.getMessagesSinceSeq(since, this.batch)
+    const rows = this.store.getLedgerRowsSinceSeq(since, this.batch)
     if (rows.length === 0) return 0
     const events: LedgerUplinkEvent[] = rows.map(toLedgerEvent)
     this.uplink.sendLedger(this.relayId, events)
@@ -142,7 +143,7 @@ export class LedgerSync {
   }
 }
 
-/** 库行 → 上行事件。srcSeq = 本机 messages.seq，是 Hub 回 ack 的对账依据。 */
+/** 库行 → 上行事件。srcSeq = 本机 seq（messages / reports 共用），是 Hub 回 ack 的对账依据。 */
 function toLedgerEvent(row: LedgerRow): LedgerMessageEvent {
   const { status, priority, seq, ...msg } = row
   return { kind: "message", msg: { ...msg, seq }, status, priority, srcSeq: seq }

@@ -103,12 +103,36 @@ describe("LedgerSync — 批量取数与上行", () => {
     assert.deepEqual(uplink.lastBatch()[0].msg.meta, { _task: { title: "T", pickReason: "explicit" } })
   })
 
-  it("@ledger 哨兵消息也进批（账目与消息同一条管道）", () => {
-    store.saveMessage(makeMsg({ id: "q1", to: LEDGER_SINK, type: "quota_report" as any }), "delivered")
+  it("上报（reports 表）按原 message 事件形状进批：to=@ledger、delivered、normal、srcSeq=本机 seq", () => {
+    store.saveReport({ id: "q1", from: "macbook:relay", type: "quota_report", payload: '{"pct_5h":42}', createdAt: "2026-11-16T00:00:00.000Z" })
     newSync().flush()
     const e = uplink.lastBatch()[0]
-    assert.equal(e.msg.to, LEDGER_SINK)
-    assert.equal(e.msg.type, "quota_report")
+    assert.deepEqual(e, {
+      kind: "message",
+      msg: { id: "q1", from: "macbook:relay", to: LEDGER_SINK, type: "quota_report", payload: '{"pct_5h":42}', createdAt: "2026-11-16T00:00:00.000Z", seq: 1 },
+      status: "delivered",
+      priority: "normal",
+      srcSeq: 1,
+    })
+  })
+
+  it("messages 与 reports 按 seq 合并上行；一次 ack 对两表同时生效", () => {
+    const report = (id: string) => store.saveReport({ id, from: "macbook:relay", type: "screen_report", payload: id, createdAt: new Date().toISOString() })
+    store.saveMessage(makeMsg({ id: "mx1" }))
+    report("rx2")
+    store.saveMessage(makeMsg({ id: "mx3" }))
+    report("rx4")
+    const sync = newSync({ batch: 3 })
+    sync.flush()
+    assert.deepEqual(uplink.lastBatch().map((e) => [e.msg.id, e.srcSeq]), [["mx1", 1], ["rx2", 2], ["mx3", 3]])
+    sync.handleAck(3)
+    assert.deepEqual(uplink.lastBatch().map((e) => e.msg.id), ["rx4"], "ack 到 3 后只剩 seq 4 的上报")
+    sync.handleAck(4)
+    report("rx5")
+    store.saveMessage(makeMsg({ id: "mx6" }))
+    uplink.sent = []
+    sync.flush()
+    assert.deepEqual(uplink.lastBatch().map((e) => e.msg.id), ["rx5", "mx6"], "已 ack 的两表行都不重发")
   })
 
   it("单批不超过 batch 上限，剩下的留给下一批", () => {

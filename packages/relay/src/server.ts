@@ -2,7 +2,7 @@ import { DoorbellMonitor } from "./doorbell.js"
 import express, { type Express } from "express"
 import type { NextFunction, Request, Response } from "express"
 import { Store } from "./store.js"
-import type { MessagePriority } from "./store.js"
+import type { MessagePriority, ReportInput } from "./store.js"
 import { Registry, PRESENCE_FRESH_MS } from "./registry.js"
 import { Router } from "./router.js"
 import { WakeHook, WAKE_GLOBAL_HOURLY_MAX, type WakeAuditEntry } from "./wake.js"
@@ -158,22 +158,29 @@ export function createServer(opts: ServerOptions): MeshServer {
   })
 
   /**
+   * 机器体检上报（发给 @ledger 的流水）：落 reports 表，不进 messages——不路由、不投递、
+   * 不进任何收件箱 / 门铃 / 唤醒对账。发 report:saved 只为让账本同步尽快上行（index.ts 订阅）；
+   * 不发 msg:send，所以不会 settle 任何停车的 /api/sync，也不会叫醒谁。
+   */
+  function saveReport(r: ReportInput): void {
+    store.saveReport(r)
+    events?.emit("report:saved", { id: r.id, from: r.from, type: r.type })
+  }
+
+  /**
    * wake 审计流水（缺口 G4：wake 的结果原本只有一行 console.warn，出事查无对证）。
    *
-   * 复用 @ledger 哨兵管道：落库即 delivered、不投递、不走 uplink，
-   * 收件人 "@ledger" 不匹配任何门铃过滤（/api/sync 的停车监听只认
-   * `to === 自己` 或 `to === '*'`），所以写审计**不会 settle 任何停车连接**，
-   * 也不会出现在任何节点的 getInbox 里。既有 ledger_sync 会把它自动上云。
+   * 作为上报落 reports 表（见 saveReport）：不投递、不进任何节点的 getInbox，
+   * 写审计**不会 settle 任何停车连接**。既有 ledger_sync 会把它随账本游标自动上云。
    *
    * 逃生阀 MESH_WAKE_AUDIT=0。写失败只记日志——记账是旁路，不是主路。
    */
   function writeWakeAudit(entry: WakeAuditEntry): void {
     if (process.env.MESH_WAKE_AUDIT === "0") return
     const from = `${deviceId}:relay`
-    const row: MeshMessage = {
+    saveReport({
       id: genMessageId(from),
       from,
-      to: LEDGER_SINK,
       type: "wake_audit",
       payload: JSON.stringify({
         wake_id: entry.wakeId,
@@ -186,9 +193,7 @@ export function createServer(opts: ServerOptions): MeshServer {
         ...(entry.attempt != null ? { attempt: entry.attempt } : {}),
       }),
       createdAt: now(),
-    }
-    store.saveMessage(row, "delivered", "normal")
-    events?.emit("msg:send", { msgId: row.id, from: row.from, to: row.to, status: "delivered" })
+    })
   }
 
   // ===== 恢复态 inject 节点的身份校验（投递前验活 + 验身份）=====
@@ -634,12 +639,11 @@ ${delegatorNodeId
   // notFound=true 时由调用方决定 HTTP 码（send/dispatch 都回 404）。
   type SubmitResult = { status: string; notFound: boolean }
   async function submitMessage(msg: MeshMessage, priority: MessagePriority): Promise<SubmitResult> {
-    // 记账哨兵 @ledger（设计 §4.3）：只落库不投递——不注入终端、不广播、不走 uplink。
-    // 对哨兵而言落库即送达，故 status 直接 delivered（不留一堆永远 submitted 的假未决行）。
+    // 记账哨兵 @ledger（老调用：codex-seat 的 quota_report、quota-probe、wake-hook 审计）：
+    // 不是消息，是上报——落 reports 表，不注入终端、不广播、不走 uplink。落库即送达，回执仍是 delivered。
     // 它不是节点，registry 里永远查不到，所以必须在 route 之前截住。
     if (msg.to === LEDGER_SINK) {
-      store.saveMessage(msg, "delivered", priority)
-      events?.emit("msg:send", { msgId: msg.id, from: msg.from, to: msg.to, status: "delivered" })
+      saveReport({ id: msg.id, from: msg.from, type: msg.type, payload: msg.payload, replyTo: msg.replyTo, meta: msg.meta, createdAt: msg.createdAt })
       return { status: "delivered", notFound: false }
     }
 
@@ -717,6 +721,26 @@ ${delegatorNodeId
     events?.emit("msg:send", { msgId: msg.id, from: msg.from, to: msg.to, status: "failed" })
     return { status: "failed", notFound: true }
   }
+
+  // ===== Report（机器体检上报：screen_report / quota_report / … → 云端账本）=====
+  // POST {from?, type, message}：落 reports 表，随账本游标上云（Hub 看到的是 to='@ledger' 的 message 事件）。
+  // 不路由、不投递、不进任何收件箱。from 缺省 <deviceId>:relay；给了就必须是本机的 nodeId——
+  // 别的前缀 Hub 会按冒名隔离，这里直接拒掉，别让上报静默丢在云端。
+  app.post("/api/report", (req: Request, res: Response) => {
+    const { from, type, message } = req.body ?? {}
+    if (typeof type !== "string" || type.trim() === "" || typeof message !== "string" || message === "") {
+      res.status(400).json({ ok: false, error: "missing required fields: type, message" })
+      return
+    }
+    const reporter = typeof from === "string" && from !== "" ? from : `${deviceId}:relay`
+    if (!reporter.startsWith(`${deviceId}:`) || reporter.length === deviceId.length + 1) {
+      res.status(400).json({ ok: false, error: `from must be a nodeId on this device (${deviceId}:…), got: ${reporter}` })
+      return
+    }
+    const id = genMessageId(reporter)
+    saveReport({ id, from: reporter, type, payload: message, createdAt: now() })
+    res.json({ ok: true, data: { reportId: id } })
+  })
 
   // ===== Send =====
   app.post("/api/send", async (req: Request, res: Response) => {

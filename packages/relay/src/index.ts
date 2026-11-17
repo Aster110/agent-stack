@@ -136,8 +136,10 @@ if (uplink) {
   // 断网期间只是发不出去，重连后从游标续传，一条不丢。逃生阀：MESH_LEDGER_SYNC=0。
   ledgerSync = new LedgerSync({ store: app.store, uplink, relayId })
   ledgerSync.start()
-  // msg:send 是"消息已落库"的唯一全路径信号（本机 send / 跨机 downlink 着陆 / 广播 / 派单都发它）。
+  // msg:send 是"消息已落库"的唯一全路径信号（本机 send / 跨机 downlink 着陆 / 广播 / 派单都发它）；
+  // report:saved 是上报落库（reports 表，与 messages 共用 seq，同一个游标上行）。
   events.on("msg:send", () => ledgerSync?.notifyWrite())
+  events.on("report:saved", () => ledgerSync?.notifyWrite())
   console.log(`[mesh-relay] ledger sync: ${ledgerSync.enabled ? "on" : "off (MESH_LEDGER_SYNC=0)"}`)
 
   const u = uplink

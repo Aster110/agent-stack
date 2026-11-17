@@ -15,6 +15,7 @@ import type { ITerminal, SpawnResult } from "./terminal/interface.js"
 import os from "node:os"
 import path from "node:path"
 import fs from "node:fs"
+import Database from "better-sqlite3"
 import type { DeviceInventory } from "@cc-mesh/protocol"
 import { MeshEventBus } from "./events.js"
 
@@ -1459,7 +1460,7 @@ type MeshServerLike = {
 }
 
 // ===== 云端账本 M1/M2：@ledger 哨兵 + /api/dispatch =====
-// 哨兵语义（设计 §4.3）：to=@ledger 只落库不投递——不注入终端、不广播、不走 uplink。
+// 哨兵语义：to=@ledger 是机器体检上报，落 reports 表（不进 messages）——不注入终端、不广播、不走 uplink。
 // 派单语义（设计 §6）：type=task + meta._task 信封，payload 原文零污染，与 send 共用投递内核。
 describe("Server — @ledger 哨兵 + /api/dispatch（云端账本接缝）", () => {
   let s: Server
@@ -1517,10 +1518,19 @@ describe("Server — @ledger 哨兵 + /api/dispatch（云端账本接缝）", ()
   }
 
   function rowOf(msgId: string): any {
-    return app.store.getMessagesSinceSeq(0, 1000).find((r: any) => r.id === msgId)
+    return app.store.getLedgerRowsSinceSeq(0, 1000).find((r: any) => r.id === msgId)
+  }
+  /** 另开只读连接看表里实况（WAL 下读得到 relay 已提交的写）。 */
+  function inTable(table: "messages" | "reports", id: string): boolean {
+    const raw = new Database(db, { readonly: true })
+    try {
+      return !!raw.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id)
+    } finally {
+      raw.close()
+    }
   }
 
-  // ===== @ledger 哨兵 =====
+  // ===== @ledger 哨兵 / 上报 =====
 
   it("send 到 @ledger：200 + status=delivered（落库即送达）", async () => {
     const { status, data } = await call("POST", "/send", {
@@ -1542,41 +1552,82 @@ describe("Server — @ledger 哨兵 + /api/dispatch（云端账本接缝）", ()
     assert.equal(transportCalls.length, transportBefore, "哨兵消息绝不走 uplink/transport")
   })
 
-  it("@ledger 消息落库：type 自由字符串保留，status=delivered，账本取数口可见", async () => {
+  it("send 到 @ledger（老调用）落 reports 不落 messages；账本取数口仍按原 message 形状给出", async () => {
     const { data } = await call("POST", "/send", {
       to: "@ledger", message: '{"pct_5h":42}', type: "quota_report",
     }, { "X-Mesh-Node": "macbook:cc-quota" })
+    assert.deepEqual(Object.keys(data.data).sort(), ["msgId", "status"], "返回形状不变")
+    assert.equal(inTable("reports", data.data.msgId), true)
+    assert.equal(inTable("messages", data.data.msgId), false, "messages 不再新增 @ledger 行")
     const row = rowOf(data.data.msgId)
-    assert.ok(row, "getMessagesSinceSeq 必须能取到哨兵行（LedgerSync 就靠它上行）")
+    assert.ok(row, "getLedgerRowsSinceSeq 必须能取到上报行（LedgerSync 就靠它上行）")
     assert.equal(row.to, "@ledger")
+    assert.equal(row.from, "macbook:cc-quota")
     assert.equal(row.type, "quota_report", "type 不收紧校验（quota_report 已在用）")
     assert.equal(row.status, "delivered")
+    assert.equal(row.priority, "normal")
     assert.equal(row.payload, '{"pct_5h":42}')
   })
 
-  it("@ledger 不污染别的节点收件箱", async () => {
-    const nodeId = await registerInject("cc-ldg-inbox")
-    const { data } = await call("POST", "/send", {
-      to: "@ledger", message: "not for you", type: "quota_report",
-    }, { "X-Mesh-Node": "macbook:cc-quota" })
-    const inbox = await call("GET", `/inbox?nodeId=${encodeURIComponent(nodeId)}`)
-    const leaked = inbox.data.data.messages.find((m: any) => m.id === data.data.msgId)
-    assert.equal(leaked, undefined, "to=@ledger 不匹配任何节点，也不是广播")
+  it("POST /api/report：落 reports，from 缺省 <本机>:relay，账本取数口可见", async () => {
+    const { status, data } = await call("POST", "/report", { type: "screen_report", message: '{"locked":false}' })
+    assert.equal(status, 200)
+    assert.equal(data.ok, true)
+    const id = data.data.reportId
+    assert.equal(inTable("reports", id), true)
+    assert.equal(inTable("messages", id), false)
+    const row = rowOf(id)
+    assert.equal(row.from, "macbook:relay")
+    assert.equal(row.to, "@ledger")
+    assert.equal(row.type, "screen_report")
+    assert.equal(row.status, "delivered")
+    assert.equal(row.payload, '{"locked":false}')
+    const withFrom = await call("POST", "/report", { from: "macbook:screen-probe", type: "screen_report", message: "x" })
+    assert.equal(withFrom.status, 200)
+    assert.equal(rowOf(withFrom.data.data.reportId).from, "macbook:screen-probe")
   })
 
-  it("@ledger 照常 emit msg:send（账本同步靠这个信号触发 debounce）", async () => {
-    const received: any[] = []
-    const fn = (d: any) => received.push(d)
-    bus.on("msg:send", fn)
+  it("POST /api/report：缺 type / message → 400；from 不是本机 nodeId → 400（Hub 会按冒名隔离）", async () => {
+    assert.equal((await call("POST", "/report", { message: "x" })).status, 400)
+    assert.equal((await call("POST", "/report", { type: "screen_report" })).status, 400)
+    assert.equal((await call("POST", "/report", { type: "  ", message: "x" })).status, 400)
+    assert.equal((await call("POST", "/report", { from: "other:relay", type: "t", message: "x" })).status, 400)
+    assert.equal((await call("POST", "/report", { from: "macbook-host", type: "t", message: "x" })).status, 400)
+    assert.equal((await call("POST", "/report", { from: "macbook:", type: "t", message: "x" })).status, 400)
+  })
+
+  it("上报不进任何收件箱：inbox / sync 都看不到", async () => {
+    const nodeId = await registerInject("cc-ldg-inbox")
+    const viaSend = await call("POST", "/send", {
+      to: "@ledger", message: "not for you", type: "quota_report",
+    }, { "X-Mesh-Node": "macbook:cc-quota" })
+    const viaReport = await call("POST", "/report", { type: "screen_report", message: "not for you either" })
+    const ids = [viaSend.data.data.msgId, viaReport.data.data.reportId]
+    const inbox = await call("GET", `/inbox?nodeId=${encodeURIComponent(nodeId)}`)
+    const synced = await call("GET", `/sync?nodeId=${encodeURIComponent(nodeId)}&since=0&timeout=0`)
+    assert.equal(synced.status, 200)
+    for (const list of [inbox.data.data.messages, synced.data.data.messages]) {
+      assert.equal(list.filter((m: any) => ids.includes(m.id)).length, 0)
+    }
+  })
+
+  it("上报发 report:saved（账本同步靠它触发 debounce），不发 msg:send（不结算长轮询、不叫醒）", async () => {
+    const reports: any[] = []
+    const sends: any[] = []
+    const onReport = (d: any) => reports.push(d)
+    const onSend = (d: any) => sends.push(d)
+    bus.on("report:saved", onReport)
+    bus.on("msg:send", onSend)
     try {
       await call("POST", "/send", { to: "@ledger", message: "ring", type: "quota_report" },
         { "X-Mesh-Node": "macbook:cc-quota" })
+      await call("POST", "/report", { type: "screen_report", message: "ring" })
     } finally {
-      bus.off("msg:send", fn)
+      bus.off("report:saved", onReport)
+      bus.off("msg:send", onSend)
     }
-    assert.equal(received.length, 1)
-    assert.equal(received[0].to, "@ledger")
-    assert.equal(received[0].status, "delivered")
+    assert.deepEqual(reports.map((r) => r.type), ["quota_report", "screen_report"])
+    assert.equal(sends.length, 0)
   })
 
   it("普通节点消息零回归：仍正常投递 + delivered", async () => {

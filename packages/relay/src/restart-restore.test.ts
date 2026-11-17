@@ -26,6 +26,7 @@ import { MeshEventBus } from "./events.js"
 import os from "node:os"
 import path from "node:path"
 import fs from "node:fs"
+import Database from "better-sqlite3"
 
 class MockTerminal implements ITerminal {
   injectLog: Array<{ sessionId: string; text: string }> = []
@@ -1085,6 +1086,25 @@ describe("wake:needed — 温唤醒接缝", () => {
     assert.equal(fired.length, 1)
     assert.equal(fired[0]!.nodeId, nodeId)
     assert.equal(fired[0]!.parkedCount, 0)
+  })
+
+  it("wake 审计流水作为上报落 reports（随账本上行），messages 不新增 @ledger 行", async () => {
+    const nodeId = await registerPull(ts.base, "cc-audit")
+    const r = await send(ts.base, nodeId, "叫醒并记账")
+    assert.equal(r.data.data.status, "accepted")
+    const audits = ts.app.store.getLedgerRowsSinceSeq(0, 10_000)
+      .filter((row) => row.type === "wake_audit" && JSON.parse(row.payload).node_id === nodeId)
+    assert.equal(audits.length, 1)
+    assert.equal(audits[0]!.to, "@ledger")
+    assert.equal(audits[0]!.from, "macbook:relay")
+    assert.equal(JSON.parse(audits[0]!.payload).decision, "fired")
+    const raw = new Database(db, { readonly: true })
+    try {
+      assert.ok(raw.prepare("SELECT 1 FROM reports WHERE id = ? AND type = 'wake_audit'").get(audits[0]!.id))
+      assert.equal((raw.prepare(`SELECT COUNT(*) AS n FROM messages WHERE "to" = '@ledger'`).get() as any).n, 0)
+    } finally {
+      raw.close()
+    }
   })
 
   it("同一节点 60 秒内重复投递不重复触发（去抖）", async () => {
