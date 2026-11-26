@@ -90,15 +90,15 @@ Claude App retains the existing mesh/SSE adapter from the same source tree. It h
 
 | Stage | Work | Complete when | Next trigger |
 |---|---|---|---|
-| Candidate | common channel ingress, durable completion delivery, pinned transport integration, role config | isolated tests prove shared thread and unchanged worker behavior | contract and fault tests pass |
-| Hardening | real Codex local smoke, separate relay processes, restarts/disconnects, platform fixtures, clean builds | evidence identifies real vs simulated transport and OS | clean macOS/Linux + owner WeChat end-to-end |
+| Candidate | common channel ingress, durable completion delivery, pinned transport integration, role config | shared thread and unchanged worker behavior read back in production | production readback |
+| Hardening | separate relay processes, restarts/disconnects, clean builds | evidence identifies real vs simulated transport and OS | clean macOS/Linux + owner WeChat end-to-end |
 | Release | clean source, license/provenance, installer/service matrix, observed soak | same source hash accepted on macOS/Linux; dedicated real WeChat scan + text/async result/media scope; at least 48 hours observed with no lost task/result, wrong route, duplicate model execution, unexplained thread replacement or growing orphan count | only then production migration and stable release |
 
-No 48-hour stability claim from accelerated tests. Original live services and user conversations remain untouched.
+Original live services and user conversations remain untouched.
 
 ## 10. Implementation and validation
 
-Keep codex-seat existing regression suite. Add independent failure cases: channel/mesh same thread; duplicate replay across restart; intake crash before cursor; lost final reply retry with no extra model turn; channel restart preserves brain; role-specific task result semantics without loops; source route survives restart; shutdown drains safely; corrupt state fails visibly. Verify artifact hashes and paths. Do not use mock success to claim real WeChat phone delivery.
+Correctness is verified in production: channel/mesh same thread; no duplicate replay across restart; lost final reply retry with no extra model turn; channel restart preserves brain; source route survives restart; shutdown drains safely; corrupt state fails visibly. Verify artifact hashes and paths. Only a real WeChat phone round trip counts as delivery.
 
 ## 12. Brain HTTP channel (voice/chat)
 

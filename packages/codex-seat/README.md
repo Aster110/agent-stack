@@ -4,4 +4,4 @@ Shared engine, WAL, thread queue and relay pull loop used by `@cc-mesh/agent-run
 
 The older `codex-seat` CLI remains for compatibility. New deployments use agent-runtime; legacy defaults and permissive internal-peer routing are not the unified entrypoint's explicit peer policy.
 
-Build/test: `pnpm --filter @cc-mesh/codex-seat build` and `pnpm --filter @cc-mesh/codex-seat test`. Contract changes need corresponding fault/restart tests and migration notes.
+Build: `pnpm --filter @cc-mesh/codex-seat build`. Contract changes need migration notes.

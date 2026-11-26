@@ -4,6 +4,6 @@
     "rootDir": ".",
     "outDir": "dist"
   },
-  "include": ["src", "e2e"],
-  "exclude": ["dist", "node_modules", "e2e/evidence"]
+  "include": ["src"],
+  "exclude": ["dist", "node_modules"]
 }

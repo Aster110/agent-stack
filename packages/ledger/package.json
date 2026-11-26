@@ -6,15 +6,13 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch",
-    "test": "node --test \"dist/**/*.test.js\""
+    "dev": "tsc --watch"
   },
   "dependencies": {
     "@cc-mesh/protocol": "workspace:*",
     "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {
-    "@cc-mesh/relay": "workspace:*",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"

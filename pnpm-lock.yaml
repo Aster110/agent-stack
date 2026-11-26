@@ -59,9 +59,6 @@ importers:
         specifier: ^8.18.0
         version: 8.20.0
     devDependencies:
-      '@cc-mesh/relay':
-        specifier: workspace:*
-        version: link:../relay
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.15
@@ -81,9 +78,6 @@ importers:
         specifier: ^13.0.3
         version: 13.0.3
     devDependencies:
-      '@cc-mesh/relay':
-        specifier: workspace:*
-        version: link:../relay
       '@types/better-sqlite3':
         specifier: ^7.6.0
         version: 7.6.13

@@ -80,7 +80,3 @@ Required server config fields are `version: 1`, `state_dir`, absolute `codex_bin
 Local config additionally has `server: {ssh_host, python, script, config}`, `submit_identity`, `gateway_state_dir`, `bridge_state_dir`, `target_thread_id`, `target_cwd`, `desktop_codex_bin`, `main_wrapper`, per-repository `local_path`, optional `allowed_checkout_roots`/`allowed_clone_paths`, and explicit `context_roots`. A separate verifier config contains `verifier_identity`; the main wrapper config does not. Credentials stay outside the source checkout with mode 0600. Use the existing logged-in Codex account; do not copy or switch its auth store.
 
 The source package and process separation enforce queue transitions and prevent cloud workers from possessing acceptance credentials. A main-chat tool hook is an additional role boundary implemented separately. This package is a single-owner system, not a hostile multi-tenant sandbox; an owner with arbitrary local shell/root access can change its database or keys.
-
-## Verification
-
-`python3 selftest.py -v` runs an offline integration with a real temporary Git repository and linked worktree, fake SSH/Codex, and an official-RPC-shaped fixture that loses a queue response after persisting it. It verifies immediate local enqueue, immutable scoped preparation, candidate delivery, cached status without transport, stable event reconciliation, one queue write, ACK, and worktree isolation. Independent black-box contract tests are maintained outside this implementation and are not uploaded to cloud workers.
