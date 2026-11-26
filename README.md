@@ -54,4 +54,4 @@ ingress:
 
 这是同一所有者管理设备和本地进程的系统，配置明确启用 `full-access`，不是多租户托管服务。凭证、地址、身份、工作目录和会话数据库属于各自的部署配置。公开版本不会连接作者的基础设施。
 
-构建：`pnpm build`。回归：`pnpm test`、`pnpm test:cli`。MIT，见 [LICENSE](LICENSE) 和 [第三方来源](THIRD_PARTY_NOTICES.md)。
+构建：`pnpm build`。MIT，见 [LICENSE](LICENSE) 和 [第三方来源](THIRD_PARTY_NOTICES.md)。

@@ -9,10 +9,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch",
-    "test": "node --test \"dist/src/**/*.test.js\"",
-    "test:contracts": "node --test dist/src/contracts.test.js",
-    "e2e": "node dist/e2e/run.js"
+    "dev": "tsc --watch"
   },
   "dependencies": {
     "@cc-mesh/protocol": "workspace:*"

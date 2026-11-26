@@ -41,8 +41,8 @@ Observations use system messages correlated through `replyTo`; relay message IDs
 
 | Stage | Scope | Next-stage trigger |
 | --- | --- | --- |
-| V1 | Isolated port, build, transport/restart/ledger/unified-runtime regression tests, PR | Reviewer acceptance and explicit deployment task |
+| V1 | Isolated port, build, PR | Reviewer acceptance and explicit deployment task |
 | V1.5 | One configured runtime rollout at a time | Actual late-result and recovery evidence |
 | V2 | Additional provider adapters | Another concrete provider needs the same contract |
 
-Required checks cover late ACK without interruption, legacy timeout followed by receipted and compaction, original-turn recovery, observation/result ordering, channel outbox retry, and correlated brain results. The parent task owns real Codex canary validation and external consumer inventory. This PR does not deploy.
+Production readback covers late ACK without interruption, legacy timeout followed by receipted and compaction, original-turn recovery, observation/result ordering, channel outbox retry, and correlated brain results. The parent task owns real Codex canary validation and external consumer inventory. This PR does not deploy.

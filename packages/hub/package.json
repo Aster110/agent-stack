@@ -7,8 +7,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "start": "node dist/index.js",
-    "test": "node --test dist/**/*.test.js"
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "@cc-mesh/ledger": "workspace:*",
@@ -16,7 +15,6 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@cc-mesh/relay": "workspace:*",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.12",
     "typescript": "^5.7.0"
